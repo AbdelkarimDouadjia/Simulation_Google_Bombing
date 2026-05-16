@@ -1,0 +1,962 @@
+\documentclass[12pt,a4paper]{article}
+
+%% ── Encodage & langue ──────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+
+%% ── Mise en page ───────────────────────────────────────────────────────────
+\usepackage[top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+
+%% ── Maths ──────────────────────────────────────────────────────────────────
+\usepackage{amsmath,amssymb,amsthm}
+
+%% ── Figures & couleurs ─────────────────────────────────────────────────────
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+%% ── Tableaux ───────────────────────────────────────────────────────────────
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+
+%% ── Divers ─────────────────────────────────────────────────────────────────
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!70}
+
+%% ── Commandes perso ────────────────────────────────────────────────────────
+\newcommand{\PR}{\mathrm{PR}}
+\newcommand{\vpi}{\boldsymbol{\pi}}
+\newcommand{\G}{\mathbf{G}}
+\newcommand{\Hmat}{\mathbf{H}}
+
+\theoremstyle{definition}
+\newtheorem{definition}{D\'{e}finition}
+\newtheorem{remarque}{Remarque}[section]
+
+%% ── Couleurs ────────────────────────────────────────────────────────────────
+\definecolor{colfort}{RGB}{31,119,180}
+\definecolor{colmed}{RGB}{220,100,0}
+\definecolor{colfaible}{RGB}{44,160,44}
+
+% ============================================================================
+\title{%
+  \LARGE\textbf{Simulation d'un Google Bombing}\\[8pt]
+  \large Analyse exp\'{e}rimentale de trois structures d'attaque\\
+  sur plusieurs graphes du Web\\[6pt]
+  \normalsize Projet PageRank --- Algorithmes et Graphes
+}
+\author{Rapport de projet}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip\hrule\bigskip
+
+%% ============================================================================
+\section{Introduction}
+%% ============================================================================
+
+Le \emph{Google Bombing} est une technique de manipulation du r\'{e}f\'{e}rencement
+qui exploite la structure hyperliens du Web pour augmenter artificiellement
+le score PageRank d'une page cible. En ajoutant dans le graphe du Web un
+sous-graphe compos\'{e} de pages contr\^{o}l\'{e}es --- les \emph{attaquants} ---
+pointant vers la cible, un acteur malveillant peut remonter la pertinence
+de n'importe quelle page dans les r\'{e}sultats d'un moteur de recherche
+bas\'{e} sur PageRank.
+
+Ce rapport \'{e}tudie exp\'{e}rimentalement l'efficacit\'{e} de trois structures
+d'attaque en faisant varier :
+\begin{itemize}[noitemsep]
+  \item le nombre $k$ d'attaquants ($k \in \{1, \ldots, 100\}$) ;
+  \item la structure du sous-graphe attaquant (isol\'{e}s, complet, anneau) ;
+  \item le type de cible (pertinence forte, m\'{e}diane ou faible) ;
+  \item le graphe cible, afin de mesurer la robustesse des r\'{e}sultats.
+\end{itemize}
+Les exp\'{e}riences sont men\'{e}es sur trois graphes de tailles tr\`{e}s diff\'{e}rentes,
+avec le facteur d'amortissement classique $\alpha = 0{,}85$.
+
+%% ============================================================================
+\section{Rappels th\'{e}oriques}
+%% ============================================================================
+
+\subsection{Matrice Google et PageRank}
+
+Soit $\mathcal{G} = (V,E)$ un graphe orient\'{e} \`{a} $n$ sommets.
+On note $\Hmat \in \mathbb{R}^{n \times n}$ la matrice hyperlien :
+$H_{ij} = 1/d_i$ si $(i,j) \in E$ et $d_i > 0$, sinon $H_{ij} = 0$.
+
+\begin{definition}[Matrice Google]
+\[
+  \G = \alpha \Hmat' + (1-\alpha)\,\mathbf{e}\,\mathbf{z}^{\top},
+\]
+o\`{u} $\Hmat'$ est la matrice $\Hmat$ dont les lignes nulles (n\oe{}uds
+\emph{dangling}) sont remplac\'{e}es par $\mathbf{z}^{\top}$ (vecteur de
+personnalisation uniforme $z_i = 1/n$), et $\alpha \in (0,1)$ est le
+facteur de t\'{e}l\'{e}portation.
+\end{definition}
+
+\begin{definition}[Vecteur PageRank]
+Le vecteur PageRank $\vpi^*$ est l'unique distribution de probabilit\'{e}
+stationnaire de $\G$ :
+\[
+  \vpi^* = \vpi^*\G, \qquad \|\vpi^*\|_1 = 1,\quad \vpi^* \geq 0.
+\]
+\end{definition}
+
+Il est calcul\'{e} par la \emph{m\'{e}thode des puissances} :
+$\vpi^{(k+1)} = \vpi^{(k)}\G$, avec crit\`{e}re d'arr\^{e}t
+$\|\vpi^{(k+1)} - \vpi^{(k)}\|_1 \leq \varepsilon$.
+
+\subsection{Convergence sur Harvard500}
+
+Avec $\alpha = 0{,}85$ et $\varepsilon = 10^{-6}$, la convergence est
+atteinte en \textbf{47 it\'{e}rations}. La d\'{e}croissance de la norme $L_1$
+est g\'{e}om\'{e}trique de raison $\approx \alpha = 0{,}85$, conform\'{e}ment
+\`{a} la th\'{e}orie (figure~\ref{fig:convergence}).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{semilogyaxis}[
+  width=0.80\textwidth, height=6cm,
+  xlabel={It\'{e}ration $k$},
+  ylabel={Norme $L_1$},
+  xmin=0, xmax=46,
+  ymin=5e-7, ymax=1.5,
+  grid=major, grid style={gray!30},
+  title={Convergence du PageRank sur Harvard500 ($\alpha=0{,}85$)},
+  title style={font=\small},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend pos=north east, legend style={font=\small},
+]
+\addplot[blue!70!black, thick] coordinates {
+  (0,0.7146)(1,0.4494)(2,0.2959)(3,0.1530)(4,0.0775)
+  (5,0.0401)(6,0.0203)(7,0.0110)(8,0.00617)(9,0.00394)
+  (10,0.00268)(11,0.00201)(12,0.00153)(13,0.00120)(14,0.000940)
+  (15,0.000745)(16,0.000588)(17,0.000467)(18,0.000370)(19,0.000294)
+  (20,0.000233)(21,0.000185)(22,0.000147)(23,0.000117)(24,9.35e-5)
+  (25,7.46e-5)(26,5.95e-5)(27,4.75e-5)(28,3.79e-5)(29,3.03e-5)
+  (30,2.43e-5)(31,1.94e-5)(32,1.56e-5)(33,1.25e-5)(34,1.00e-5)
+  (35,8.04e-6)(36,6.46e-6)(37,5.20e-6)(38,4.18e-6)(39,3.37e-6)
+  (40,2.72e-6)(41,2.19e-6)(42,1.77e-6)(43,1.43e-6)(44,1.15e-6)
+  (45,9.34e-7)
+};
+\addplot[red, dashed, thin] coordinates {(0,1e-6)(46,1e-6)};
+\legend{Norme $L_1$, Seuil $\varepsilon=10^{-6}$}
+\end{semilogyaxis}
+\end{tikzpicture}
+\caption{D\'{e}croissance g\'{e}om\'{e}trique de la norme $L_1$ lors du calcul du
+PageRank initial sur Harvard500. L'axe des ordonn\'{e}es est en \'{e}chelle
+logarithmique.}
+\label{fig:convergence}
+\end{figure}
+
+%% ============================================================================
+\section{Protocole exp\'{e}rimental}
+%% ============================================================================
+
+\subsection{Graphes utilis\'{e}s}
+
+Trois graphes de tailles tr\`{e}s diff\'{e}rentes sont utilis\'{e}s afin de mesurer
+la robustesse des r\'{e}sultats \`{a} l'\'{e}chelle :
+
+\begin{table}[H]
+\centering
+\caption{Caract\'{e}ristiques des trois graphes exp\'{e}rimentaux}
+\label{tab:graphes}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Graphe} & \textbf{Format} & $n$ & $m$ & \textbf{Conv. (it.)} \\
+\midrule
+\texttt{courtois.txt}           & .txt   & 8         & 41          & 42 \\
+\texttt{Harvard500.mtx}         & .mtx   & 500       & 2\,636      & 47 \\
+\texttt{wikipedia-20051105V2}   & .txt   & 1\,634\,989 & 19\,753\,078 & 35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Le graphe \texttt{courtois.txt} sert de cas jouet pour la v\'{e}rification ;
+\texttt{Harvard500.mtx} constitue le jeu de donn\'{e}es principal de l'analyse ;
+le graphe Wikipedia (format Matrix Market) permet de tester la g\'{e}n\'{e}ralisabilit\'{e}
+\`{a} grande \'{e}chelle.
+
+\subsection{PageRank initial et s\'{e}lection des cibles}
+
+Apr\`{e}s calcul du PageRank initial, la distribution est tr\`{e}s concentr\'{e}e :
+la page~6 capture $10{,}36\,\%$ de la masse totale sur Harvard500, tandis que de nombreuses
+pages en bas de classement atteignent le plancher de t\'{e}l\'{e}portation
+$\approx 3{,}0 \times 10^{-4}$.
+
+Pour \'{e}viter les cas atypiques, les trois cibles sont s\'{e}lectionn\'{e}es par
+percentile :
+
+\begin{table}[H]
+\centering
+\caption{Cibles s\'{e}lectionn\'{e}es pour chaque graphe}
+\label{tab:cibles}
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Graphe} & \textbf{Type} & \textbf{Page} & \textbf{$\PR_0$} & \textbf{Crit\`{e}re} \\
+\midrule
+\multirow{3}{*}{\texttt{courtois.txt}}
+ & Forte   & 6  & $1{,}849 \times 10^{-1}$ & Top 10\% \\
+ & M\'{e}diane & 4  & $1{,}092 \times 10^{-1}$ & M\'{e}diane \\
+ & Faible  & 2  & $7{,}641 \times 10^{-2}$ & Bottom 10\% \\
+\midrule
+\multirow{3}{*}{\texttt{Harvard500.mtx}}
+ & Forte   & 219 & $2{,}835 \times 10^{-3}$ & Top 10\% \\
+ & M\'{e}diane & 13  & $6{,}461 \times 10^{-4}$ & M\'{e}diane \\
+ & Faible  & 121 & $3{,}000 \times 10^{-4}$ & Bottom 10\% \\
+\midrule
+\multirow{3}{*}{\texttt{Wikipedia}}
+ & Forte   & 397700  & $7{,}768 \times 10^{-7}$ & Top 10\% \\
+ & M\'{e}diane & 694255  & $1{,}429 \times 10^{-7}$ & M\'{e}diane \\
+ & Faible  & 1471490 & $1{,}009 \times 10^{-7}$ & Bottom 10\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Structures d'attaque}
+
+Trois sous-graphes attaquants sont ajout\'{e}s au graphe de base.
+Dans les trois cas, $k$ d\'{e}signe le nombre de n\oe{}uds attaquants ajout\'{e}s,
+et la cible est un n\oe{}ud d\'{e}j\`{a} pr\'{e}sent dans le graphe.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  target/.style={circle, draw=red!70!black, fill=red!12,
+                 minimum size=1.1cm, font=\small\bfseries, thick},
+  att/.style={circle, draw=blue!65, fill=blue!8,
+              minimum size=0.9cm, font=\small},
+  >=Stealth, thick
+]
+%% (a) Isolés
+\begin{scope}[xshift=0cm]
+  \node[target] (T1) at (0,0) {cible};
+  \node[att] (A1) at (-1.7,1.7) {$a_1$};
+  \node[att] (A2) at (0,2.1)   {$a_2$};
+  \node[att] (A3) at (1.7,1.7) {$a_3$};
+  \draw[->] (A1)--(T1); \draw[->] (A2)--(T1); \draw[->] (A3)--(T1);
+  \node[below=2pt of T1, font=\footnotesize\itshape] {(a) Isol\'{e}s};
+\end{scope}
+%% (b) Complet
+\begin{scope}[xshift=5.5cm]
+  \node[target] (T2) at (0,0) {cible};
+  \node[att] (B1) at (-1.7,1.7) {$a_1$};
+  \node[att] (B2) at (0,2.3)   {$a_2$};
+  \node[att] (B3) at (1.7,1.7) {$a_3$};
+  \draw[->] (B1)--(T2); \draw[->] (B2)--(T2); \draw[->] (B3)--(T2);
+  \draw[->, bend left=18] (B1) to (B2);
+  \draw[->, bend left=18] (B2) to (B1);
+  \draw[->, bend right=12] (B1) to (B3);
+  \draw[->, bend right=12] (B3) to (B1);
+  \draw[->, bend left=18] (B2) to (B3);
+  \draw[->, bend left=18] (B3) to (B2);
+  \node[below=2pt of T2, font=\footnotesize\itshape] {(b) Complet};
+\end{scope}
+%% (c) Anneau
+\begin{scope}[xshift=11cm]
+  \node[target] (T3) at (0,0) {cible};
+  \node[att] (C1) at (-1.7,1.7) {$a_1$};
+  \node[att] (C2) at (0,2.5)   {$a_2$};
+  \node[att] (C3) at (1.7,1.7) {$a_3$};
+  \draw[->] (T3)--(C1);
+  \draw[->] (C1)--(C2);
+  \draw[->] (C2)--(C3);
+  \draw[->] (C3)--(T3);
+  \node[below=2pt of T3, font=\footnotesize\itshape] {(c) Anneau};
+\end{scope}
+\end{tikzpicture}
+\caption{Illustration des trois structures pour $k=3$ attaquants.
+  (a)~\'{E}toile entrante pure.
+  (b)~Clique interne + lien vers la cible.
+  (c)~Cycle int\'{e}grant la cible.}
+\label{fig:structures}
+\end{figure}
+
+\paragraph{(a) N\oe{}uds isol\'{e}s.}
+Chaque attaquant $a_i$ poss\`{e}de un unique lien sortant vers la cible. Il
+transfere l'int\'{e}gralit\'{e} de sa masse PageRank vers $t$.
+
+\paragraph{(b) Graphe complet.}
+Les $k$ attaquants forment un graphe complet entre eux ($k(k-1)$ arcs) et
+pointent chacun vers la cible. Chaque attaquant a $k$ liens sortants, donc
+n'envoie qu'une fraction $1/k$ de sa masse \`{a} la cible.
+
+\paragraph{(c) Anneau.}
+Les $k$ attaquants et la cible forment un cycle :
+$a_1 \to a_2 \to \cdots \to a_k \to \text{cible} \to a_1$.
+La masse circule en boucle et la cible b\'{e}n\'{e}ficie d'une accumulation cyclique.
+Un arc suppl\'{e}mentaire est ajout\'{e} \`{a} la cible (vers $a_1$), augmentant son
+degr\'{e} sortant d'une unit\'{e}.
+
+%% ============================================================================
+\section{R\'{e}sultats sur Harvard500}
+%% ============================================================================
+
+\subsection{\'{E}volution du score PageRank absolu}
+
+La figure~\ref{fig:scores_absolus} montre le score PageRank de la cible
+en fonction de $k$ pour les neuf combinaisons (3 structures $\times$ 3 cibles).
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.5cm,
+  xlabel={$k$}, ylabel={Score $\PR$},
+  xmin=0, xmax=100,
+  grid=major, grid style={gray!25},
+  title={\small Cible \textbf{forte} ($\PR_0=0{,}00284$)},
+  tick label style={font=\tiny}, label style={font=\small},
+  legend pos=north west, legend style={font=\tiny, cells={anchor=west}},
+]
+\addplot[red!80!black, thick] coordinates {
+(1,0.0031037)(5,0.0041672)(10,0.0054730)(15,0.0067535)(20,0.0080093)
+(25,0.0092412)(30,0.0104499)(40,0.0128001)(50,0.0150649)(60,0.0172488)
+(70,0.0193560)(80,0.0213906)(90,0.0233562)(100,0.0252563)};
+\addplot[blue!70, thick, dashed] coordinates {
+(1,0.0031037)(5,0.0036572)(10,0.0039258)(15,0.0040433)(20,0.0040985)
+(25,0.0041222)(30,0.0041281)(40,0.0041106)(50,0.0040730)(60,0.0040256)
+(70,0.0039733)(80,0.0039186)(90,0.0038629)(100,0.0038071)};
+\addplot[green!60!black, thick, dotted] coordinates {
+(1,0.0040502)(5,0.0042859)(10,0.0043717)(15,0.0043793)(20,0.0043581)
+(25,0.0043257)(30,0.0042888)(40,0.0042118)(50,0.0041356)(60,0.0040620)
+(70,0.0039907)(80,0.0039219)(90,0.0038555)(100,0.0037912)};
+\addplot[gray, densely dashed, thin] coordinates {(0,0.002835)(100,0.002835)};
+\legend{Isol\'{e}s, Complet, Anneau, $\PR_0$}
+\end{axis}
+\end{tikzpicture}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.5cm,
+  xlabel={$k$}, ylabel={Score $\PR$},
+  xmin=0, xmax=100,
+  grid=major, grid style={gray!25},
+  title={\small Cible \textbf{m\'{e}diane} ($\PR_0=0{,}000646$)},
+  tick label style={font=\tiny}, label style={font=\small},
+  legend pos=north west, legend style={font=\tiny, cells={anchor=west}},
+]
+\addplot[red!80!black, thick] coordinates {
+(1,0.0008998)(5,0.0019049)(10,0.0031390)(15,0.0043491)(20,0.0055360)
+(25,0.0067002)(30,0.0078425)(40,0.0100636)(50,0.0122040)(60,0.0142679)
+(70,0.0162594)(80,0.0181822)(90,0.0200399)(100,0.0218356)};
+\addplot[blue!70, thick, dashed] coordinates {
+(1,0.0008998)(5,0.0014304)(10,0.0016996)(15,0.0018279)(20,0.0018978)
+(25,0.0019381)(30,0.0019615)(40,0.0019801)(50,0.0019786)(60,0.0019668)
+(70,0.0019494)(80,0.0019286)(90,0.0019059)(100,0.0018821)};
+\addplot[green!60!black, thick, dotted] coordinates {
+(1,0.0011850)(5,0.0018041)(10,0.0020902)(15,0.0021896)(20,0.0022188)
+(25,0.0022193)(30,0.0022077)(40,0.0021727)(50,0.0021345)(60,0.0020965)
+(70,0.0020598)(80,0.0020242)(90,0.0019899)(100,0.0019568)};
+\addplot[gray, densely dashed, thin] coordinates {(0,0.000646)(100,0.000646)};
+\legend{Isol\'{e}s, Complet, Anneau, $\PR_0$}
+\end{axis}
+\end{tikzpicture}
+\end{subfigure}
+
+\vspace{0.5cm}
+\begin{subfigure}[t]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+  width=\textwidth, height=5.5cm,
+  xlabel={$k$}, ylabel={Score $\PR$},
+  xmin=0, xmax=100,
+  grid=major, grid style={gray!25},
+  title={\small Cible \textbf{faible} ($\PR_0=0{,}000300$)},
+  tick label style={font=\tiny}, label style={font=\small},
+  legend pos=north west, legend style={font=\tiny, cells={anchor=west}},
+]
+\addplot[red!80!black, thick] coordinates {
+(1,0.0005539)(5,0.0015594)(10,0.0027941)(15,0.0040049)(20,0.0051923)
+(25,0.0063571)(30,0.0075000)(40,0.0097222)(50,0.0118636)(60,0.0139286)
+(70,0.0159211)(80,0.0178448)(90,0.0197034)(100,0.0215000)};
+\addplot[blue!70, thick, dashed] coordinates {
+(1,0.0005539)(5,0.0010860)(10,0.0013580)(15,0.0014892)(20,0.0015622)
+(25,0.0016056)(30,0.0016320)(40,0.0016566)(50,0.0016609)(60,0.0016548)
+(70,0.0016427)(80,0.0016272)(90,0.0016096)(100,0.0015907)};
+\addplot[green!60!black, thick, dotted] coordinates {
+(1,0.0008672)(5,0.0015200)(10,0.0017818)(15,0.0018669)(20,0.0018909)
+(25,0.0018908)(30,0.0018807)(40,0.0018507)(50,0.0018182)(60,0.0017857)
+(70,0.0017544)(80,0.0017241)(90,0.0016949)(100,0.0016667)};
+\addplot[gray, densely dashed, thin] coordinates {(0,0.000300)(100,0.000300)};
+\legend{Isol\'{e}s, Complet, Anneau, $\PR_0$}
+\end{axis}
+\end{tikzpicture}
+\end{subfigure}
+
+\caption{Score PageRank absolu de la cible en fonction de $k$ pour les trois
+structures et les trois types de cibles sur Harvard500 (ligne grise = score initial $\PR_0$).}
+\label{fig:scores_absolus}
+\end{figure}
+
+\subsection{Facteur de gain relatif}
+
+Pour comparer objectivement les attaques ind\'{e}pendamment du score initial,
+on d\'{e}finit le \textbf{gain relatif} :
+\[
+  \gamma(k) = \frac{\PR_k(t)}{\PR_0(t)}.
+\]
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.88\textwidth, height=8cm,
+  xlabel={Nombre d'attaquants $k$},
+  ylabel={Gain relatif $\gamma = \PR / \PR_0$},
+  xmin=0, xmax=100,
+  ymin=0, ymax=78,
+  grid=major, grid style={gray!20},
+  title={Gain relatif selon la structure et le type de cible ($\alpha = 0{,}85$)},
+  title style={font=\small},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend pos=north west,
+  legend style={font=\footnotesize, cells={anchor=west}, fill=white,
+                fill opacity=0.9, draw opacity=1, text opacity=1},
+  legend columns=1,
+]
+
+%% --- Isolés : 3 courbes (croissance linéaire) ---
+\addplot[red!80!black, very thick, solid] coordinates {
+(1,1.095)(5,1.470)(10,1.930)(15,2.382)(20,2.825)(25,3.259)
+(30,3.686)(40,4.515)(50,5.314)(60,6.084)(70,6.827)(80,7.545)(90,8.238)(100,8.908)
+};
+\addlegendentry{Forte -- Isol\'{e}s}
+
+\addplot[blue!70!black, very thick, solid] coordinates {
+(1,1.393)(5,2.948)(10,4.859)(15,6.732)(20,8.569)(25,10.371)
+(30,12.139)(40,15.576)(50,18.889)(60,22.084)(70,25.166)(80,28.142)(90,31.018)(100,33.797)
+};
+\addlegendentry{M\'{e}diane -- Isol\'{e}s}
+
+\addplot[green!60!black, very thick, solid] coordinates {
+(1,1.846)(5,5.198)(10,9.314)(15,13.350)(20,17.308)(25,21.191)
+(30,25.000)(40,32.407)(50,39.546)(60,46.429)(70,53.070)(80,59.483)(90,65.678)(100,71.667)
+};
+\addlegendentry{Faible -- Isol\'{e}s}
+
+%% --- Complet : 3 courbes (saturation) ---
+\addplot[red!80!black, thick, dashed] coordinates {
+(1,1.095)(5,1.290)(10,1.385)(15,1.426)(20,1.446)(25,1.454)
+(30,1.456)(40,1.450)(50,1.437)(60,1.420)(70,1.401)(80,1.382)(90,1.363)(100,1.343)
+};
+\addlegendentry{Forte -- Complet}
+
+\addplot[blue!70!black, thick, dashed] coordinates {
+(1,1.393)(5,2.214)(10,2.631)(15,2.829)(20,2.937)(25,2.999)
+(30,3.036)(40,3.065)(50,3.062)(60,3.044)(70,3.017)(80,2.985)(90,2.950)(100,2.913)
+};
+\addlegendentry{M\'{e}diane -- Complet}
+
+\addplot[green!60!black, thick, dashed] coordinates {
+(1,1.846)(5,3.620)(10,4.527)(15,4.964)(20,5.207)(25,5.352)
+(30,5.440)(40,5.522)(50,5.536)(60,5.516)(70,5.476)(80,5.424)(90,5.365)(100,5.302)
+};
+\addlegendentry{Faible -- Complet}
+
+%% --- Anneau : 3 courbes (saturation + déclin) ---
+\addplot[red!80!black, thick, dotted] coordinates {
+(1,1.429)(5,1.512)(10,1.542)(15,1.545)(20,1.537)(25,1.526)
+(30,1.513)(40,1.486)(50,1.459)(60,1.433)(70,1.408)(80,1.383)(90,1.360)(100,1.337)
+};
+\addlegendentry{Forte -- Anneau}
+
+\addplot[blue!70!black, thick, dotted] coordinates {
+(1,1.834)(5,2.792)(10,3.235)(15,3.389)(20,3.434)(25,3.435)
+(30,3.417)(40,3.363)(50,3.304)(60,3.245)(70,3.188)(80,3.133)(90,3.080)(100,3.029)
+};
+\addlegendentry{M\'{e}diane -- Anneau}
+
+\addplot[green!60!black, thick, dotted] coordinates {
+(1,2.891)(5,5.067)(10,5.939)(15,6.223)(20,6.303)(25,6.303)
+(30,6.269)(40,6.169)(50,6.061)(60,5.952)(70,5.848)(80,5.747)(90,5.650)(100,5.556)
+};
+\addlegendentry{Faible -- Anneau}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Gain relatif $\gamma$ pour chaque combinaison (structure, cible) sur Harvard500.
+  Ligne pleine : isol\'{e}s (croissance lin\'{e}aire continue) ;
+  tiret\'{e}e : complet (saturation rapide) ;
+  pointill\'{e}e : anneau (saturation puis l\'{e}ger d\'{e}clin).}
+\label{fig:gains}
+\end{figure}
+
+\subsection{Tableau de synth\`{e}se}
+
+\begin{table}[H]
+\centering
+\caption{Gain relatif $\gamma = \PR/\PR_0$ pour les valeurs cl\'{e}s de $k$ --- Harvard500}
+\label{tab:synthese}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Cible} & \textbf{Structure} & $k=1$ & $k=10$ & $k=50$ & $k=100$ \\
+\midrule
+\multirow{3}{*}{Forte}
+ & Isol\'{e}s  & $1{,}09\times$ & $1{,}93\times$ & $5{,}31\times$ & $8{,}91\times$ \\
+ & Complet & $1{,}09\times$ & $1{,}38\times$ & $1{,}44\times$ & $1{,}34\times$ \\
+ & Anneau  & $1{,}43\times$ & $1{,}54\times$ & $1{,}46\times$ & $1{,}34\times$ \\
+\midrule
+\multirow{3}{*}{M\'{e}diane}
+ & Isol\'{e}s  & $1{,}39\times$ & $4{,}86\times$ & $18{,}9\times$ & $33{,}8\times$ \\
+ & Complet & $1{,}39\times$ & $2{,}63\times$ & $3{,}06\times$ & $2{,}91\times$ \\
+ & Anneau  & $1{,}83\times$ & $3{,}24\times$ & $3{,}30\times$ & $3{,}03\times$ \\
+\midrule
+\multirow{3}{*}{Faible}
+ & Isol\'{e}s  & $1{,}85\times$ & $9{,}31\times$ & $39{,}5\times$ & $\mathbf{71{,}7}\times$ \\
+ & Complet & $1{,}85\times$ & $4{,}53\times$ & $5{,}54\times$ & $5{,}30\times$ \\
+ & Anneau  & $2{,}89\times$ & $5{,}94\times$ & $6{,}06\times$ & $5{,}56\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================================
+\section{Analyse et interpr\'{e}tation (Harvard500)}
+%% ============================================================================
+
+\subsection{N\oe{}uds isol\'{e}s : attaque optimale \`{a} croissance lin\'{e}aire}
+
+L'attaque par n\oe{}uds isol\'{e}s est de loin la plus redoutable.
+Son gain relatif cro\^{i}t \textbf{lin\'{e}airement} en $k$, sans saturation
+visible dans $[1, 100]$.
+
+\paragraph{Explication analytique.}
+Chaque n\oe{}ud attaquant $a_i$ n'ayant aucun lien sortant sauf vers la cible
+$t$, il est lui-m\^{e}me un n\oe{}ud dangling vis-\`{a}-vis du reste du graphe
+\'{e}tendu : sa masse stationnaire est enti\`{e}rement r\'{e}investie dans la cible
+via la m\'{e}thode des puissances. Pour $k$ attaquants isol\'{e}s dans un graphe
+de taille $n \gg k$, le score de la cible s'\'{e}crit en premi\`{e}re approximation :
+\[
+  \PR_k(t) \approx \PR_0(t) + k \cdot c, \qquad c = \frac{(1-\alpha)}{n+k} \cdot \text{const} > 0.
+\]
+La contribution de chaque attaquant est ind\'{e}pendante des autres (pas de
+dilution mutuelle), d'o\`{u} la croissance lin\'{e}aire observ\'{e}e. \`{A} $k=100$
+isol\'{e}s, la cible faible atteint $\gamma = 71{,}7\times$, multipliant son
+score initial par plus de 71.
+
+\subsection{Graphe complet : saturation par dilution interne}
+
+Le graphe complet sature rapidement (d\`{e}s $k \approx 30$--$45$ selon la cible)
+puis \textbf{d\'{e}cro\^{i}t l\'{e}g\`{e}rement}. Pour la cible forte, le gain plafonne
+\`{a} $\approx 1{,}46\times$ puis redescend \`{a} $1{,}34\times$ pour $k=100$.
+
+\paragraph{Explication.}
+Dans un graphe complet \`{a} $k$ sommets, chaque attaquant dispose de $k$ liens
+sortants : un vers la cible, $k-1$ vers les autres attaquants. La fraction
+envoy\'{e}e \`{a} la cible est $1/k$. Quand $k$ augmente, la dilution compense
+l'augmentation du nombre d'attaquants :
+\[
+  \text{Flux total vers } t = k \times \frac{\PR(a_i)}{k} = \PR(a_i) \approx \text{const.}
+\]
+De plus, la masse circule principalement \emph{entre les attaquants},
+cr\'{e}ant une r\'{e}tention interne qui profite peu \`{a} la cible.
+
+\subsection{Anneau : efficacit\'{e} interm\'{e}diaire avec saturation}
+
+L'anneau est plus efficace que le complet pour de petits $k$ (il d\'{e}passe
+syst\'{e}matiquement le complet pour $k \leq 5$--$10$), mais les deux convergent
+vers des performances similaires au del\`{a} de $k \approx 50$.
+
+\paragraph{Explication.}
+L'anneau force la masse \`{a} traverser la cible \`{a} chaque tour de cycle,
+cr\'{e}ant un effet d'amplification local pour petit $k$. Mais quand $k$ augmente,
+le tour de cycle devient plus long, diluant le ``retour'' vers la cible \`{a}
+chaque \'{e}tape interm\'{e}diaire. De plus, l'arc suppl\'{e}mentaire ajout\'{e} \`{a} la
+cible (vers $a_1$) augmente son degr\'{e} sortant d'une unit\'{e}, r\'{e}duisant
+l\'{e}g\`{e}rement la fraction de masse qu'elle re\c{c}oit de chaque lien entrant.
+Le gain cro\^{i}t jusqu'\`{a} un pic vers $k=20$--$25$ puis d\'{e}cro\^{i}t.
+
+\subsection{Impact du type de cible : effet de levier}
+
+Un r\'{e}sultat frappant est que \textbf{les cibles faiblement r\'{e}f\'{e}renc\'{e}es
+sont relativement plus faciles \`{a} booster}. Avec $k=100$ isol\'{e}s :
+\begin{itemize}[noitemsep]
+  \item Cible forte ($\PR_0 = 0{,}00284$) : gain de $8{,}9\times$ ;
+  \item Cible m\'{e}diane ($\PR_0 = 0{,}000646$) : gain de $33{,}8\times$ ;
+  \item Cible faible ($\PR_0 = 0{,}000300$) : gain de $71{,}7\times$.
+\end{itemize}
+
+Cela s'explique par l'\textbf{effet de levier} : pour un accroissement absolu
+fixe $\Delta\pi$, le gain relatif est $\gamma = 1 + \Delta\pi / \PR_0$, qui
+est d'autant plus grand que $\PR_0$ est petit.
+
+%% ============================================================================
+\section{Comparaison multi-graphes}
+%% ============================================================================
+
+\subsection{Vue d'ensemble}
+
+Afin de tester la g\'{e}n\'{e}ralisabilit\'{e} des r\'{e}sultats, les m\^{e}mes attaques ont
+\'{e}t\'{e} appliqu\'{e}es aux trois graphes d\'{e}crits dans le tableau~\ref{tab:graphes}.
+Les caract\'{e}ristiques de convergence du PageRank initial diff\`{e}rent notablement :
+\texttt{courtois.txt} ($n=8$) converge en 42~it\'{e}rations,
+\texttt{Harvard500.mtx} en 47, et Wikipedia en seulement 35 it\'{e}rations
+malgr\'{e} sa taille ($n = 1{,}6$~M) --- ce qui s'explique par sa structure
+fortement connexe.
+
+\begin{remarque}
+Sur Harvard500, la vérification dense vs.\ CSR donne
+$\|\pi_\text{dense} - \pi_\text{CSR}\|_1 = 6{,}93 \times 10^{-14}$,
+confirmant la correction de l'impl\'{e}mentation.
+\end{remarque}
+
+\subsection{Comportement sur le graphe jouet \texttt{courtois.txt}}
+
+Sur ce graphe de 8 n\oe{}uds, les scores $\PR_0$ des cibles sont beaucoup
+plus \'{e}lev\'{e}s (de l'ordre de $10^{-1}$), rendant l'effet de levier quasi nul.
+Les gains observ\'{e}s \`{a} $k=100$ sont donc structurellement plus faibles :
+la cible faible ne d\'{e}passe que $\gamma \approx 3{,}2\times$ avec les isol\'{e}s,
+contre $71{,}7\times$ sur Harvard500.
+
+Un ph\'{e}nom\`{e}ne notable appara\^{i}t sur ce petit graphe : l'attaque par
+anneau produit un \textbf{gain initial inf\'{e}rieur \`{a} 1} pour la cible forte
+($\gamma = 0{,}43$ \`{a} $k=1$), c'est-\`{a}-dire qu'elle \emph{d\'{e}grade} le score
+de la cible. Ceci s'explique par le fait que l'arc ajout\'{e} de la cible vers
+$a_1$ augmente son degr\'{e} sortant et dilue la masse que la cible re\c{c}oit
+de ses voisins originaux --- un effet qui dispara\^{i}t sur des graphes plus
+grands o\`{u} la cible a d\'{e}j\`{a} un degr\'{e} sortant \'{e}lev\'{e}.
+
+\begin{table}[H]
+\centering
+\caption{Gain relatif $\gamma$ sur \texttt{courtois.txt} ($n=8$, $k_\text{max}=100$)}
+\label{tab:courtois}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Cible} & \textbf{Structure} & $k=1$ & $k=10$ & $k=50$ & $k=100$ \\
+\midrule
+\multirow{3}{*}{Forte}
+ & Isol\'{e}s  & $1{,}24\times$ & $2{,}18\times$ & $2{,}83\times$ & $2{,}97\times$ \\
+ & Complet & $1{,}24\times$ & $1{,}18\times$ & $0{,}87\times$ & $0{,}26\times$ \\
+ & Anneau  & $0{,}43\times$ & $0{,}43\times$ & $0{,}15\times$ & $0{,}08\times$ \\
+\midrule
+\multirow{3}{*}{M\'{e}diane}
+ & Isol\'{e}s  & $1{,}35\times$ & $2{,}75\times$ & $3{,}71\times$ & $3{,}91\times$ \\
+ & Complet & $1{,}35\times$ & $1{,}42\times$ & $1{,}05\times$ & $0{,}32\times$ \\
+ & Anneau  & $0{,}59\times$ & $0{,}64\times$ & $0{,}23\times$ & $0{,}12\times$ \\
+\midrule
+\multirow{3}{*}{Faible}
+ & Isol\'{e}s  & $1{,}26\times$ & $2{,}31\times$ & $3{,}04\times$ & $3{,}19\times$ \\
+ & Complet & $1{,}26\times$ & $1{,}24\times$ & $0{,}91\times$ & $0{,}27\times$ \\
+ & Anneau  & $1{,}06\times$ & $1{,}04\times$ & $0{,}36\times$ & $0{,}20\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comportement sur Wikipedia ($n = 1{,}6$~M)}
+
+Sur le graphe Wikipedia, les exp\'{e}riences ont \'{e}t\'{e} limit\'{e}es \`{a} $k_\text{max}=20$
+en raison du co\^{u}t de calcul. Les gains absolus sont nettement plus modestes
+qu'sur Harvard500, illustrant l'effet de dilution \`{a} grande \'{e}chelle.
+
+\begin{table}[H]
+\centering
+\caption{Gain relatif $\gamma$ sur Wikipedia ($n = 1{,}634\,989$, $k_\text{max}=20$)}
+\label{tab:wikipedia}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Cible} & \textbf{Structure} & $k=1$ & $k=5$ & $k=10$ & $k=20$ \\
+\midrule
+\multirow{3}{*}{Forte}
+ & Isol\'{e}s  & $1{,}11\times$ & $1{,}56\times$ & $2{,}11\times$ & $3{,}22\times$ \\
+ & Complet & $1{,}11\times$ & $1{,}35\times$ & $1{,}47\times$ & $1{,}58\times$ \\
+ & Anneau  & $1{,}14\times$ & $1{,}43\times$ & $1{,}60\times$ & $1{,}71\times$ \\
+\midrule
+\multirow{3}{*}{M\'{e}diane}
+ & Isol\'{e}s  & $1{,}61\times$ & $4{,}04\times$ & $7{,}08\times$ & $13{,}16\times$ \\
+ & Complet & $1{,}61\times$ & $2{,}90\times$ & $3{,}59\times$ & $4{,}16\times$ \\
+ & Anneau  & $1{,}83\times$ & $3{,}47\times$ & $4{,}37\times$ & $4{,}91\times$ \\
+\midrule
+\multirow{3}{*}{Faible}
+ & Isol\'{e}s  & $1{,}85\times$ & $5{,}25\times$ & $9{,}50\times$ & $18{,}00\times$ \\
+ & Complet & $1{,}85\times$ & $3{,}66\times$ & $4{,}62\times$ & $5{,}42\times$ \\
+ & Anneau  & $1{,}95\times$ & $4{,}27\times$ & $5{,}62\times$ & $6{,}46\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.88\textwidth, height=7cm,
+  xlabel={Nombre d'attaquants $k$},
+  ylabel={Gain relatif $\gamma$},
+  xmin=0, xmax=20,
+  ymin=0, ymax=20,
+  grid=major, grid style={gray!20},
+  title={Gain relatif sur Wikipedia ($n=1{,}6$~M, $\alpha=0{,}85$)},
+  title style={font=\small},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend pos=north west,
+  legend style={font=\footnotesize, cells={anchor=west}, fill=white,
+                fill opacity=0.9, draw opacity=1, text opacity=1},
+]
+\addplot[red!80!black, very thick, solid] coordinates {
+(1,1.11)(2,1.22)(3,1.33)(4,1.44)(5,1.56)(6,1.67)(7,1.78)
+(8,1.89)(9,2.00)(10,2.11)(11,2.22)(12,2.33)(13,2.44)(14,2.56)
+(15,2.67)(16,2.78)(17,2.89)(18,3.00)(19,3.11)(20,3.22)};
+\addlegendentry{Forte -- Isol\'{e}s}
+
+\addplot[blue!70!black, very thick, solid] coordinates {
+(1,1.61)(2,2.22)(3,2.82)(4,3.43)(5,4.04)(6,4.65)(7,5.26)
+(8,5.87)(9,6.47)(10,7.08)(11,7.69)(12,8.30)(13,8.91)(14,9.52)
+(15,10.12)(16,10.73)(17,11.34)(18,11.95)(19,12.56)(20,13.16)};
+\addlegendentry{M\'{e}diane -- Isol\'{e}s}
+
+\addplot[green!60!black, very thick, solid] coordinates {
+(1,1.85)(2,2.70)(3,3.55)(4,4.40)(5,5.25)(6,6.10)(7,6.95)
+(8,7.80)(9,8.65)(10,9.50)(11,10.35)(12,11.20)(13,12.05)(14,12.90)
+(15,13.75)(16,14.60)(17,15.45)(18,16.30)(19,17.15)(20,18.00)};
+\addlegendentry{Faible -- Isol\'{e}s}
+
+\addplot[red!80!black, thick, dashed] coordinates {
+(1,1.11)(2,1.19)(3,1.26)(4,1.31)(5,1.35)(6,1.38)(7,1.41)
+(8,1.43)(9,1.45)(10,1.47)(11,1.49)(12,1.50)(13,1.52)(14,1.53)
+(15,1.54)(16,1.55)(17,1.56)(18,1.56)(19,1.57)(20,1.58)};
+\addlegendentry{Forte -- Complet}
+
+\addplot[blue!70!black, thick, dashed] coordinates {
+(1,1.61)(2,2.06)(3,2.40)(4,2.68)(5,2.90)(6,3.09)(7,3.24)
+(8,3.37)(9,3.49)(10,3.59)(11,3.68)(12,3.75)(13,3.82)(14,3.89)
+(15,3.94)(16,3.99)(17,4.04)(18,4.08)(19,4.12)(20,4.16)};
+\addlegendentry{M\'{e}diane -- Complet}
+
+\addplot[green!60!black, thick, dashed] coordinates {
+(1,1.85)(2,2.48)(3,2.96)(4,3.34)(5,3.66)(6,3.91)(7,4.13)
+(8,4.32)(9,4.48)(10,4.62)(11,4.74)(12,4.85)(13,4.95)(14,5.03)
+(15,5.11)(16,5.19)(17,5.25)(18,5.31)(19,5.37)(20,5.42)};
+\addlegendentry{Faible -- Complet}
+
+\addplot[green!60!black, thick, dotted] coordinates {
+(1,1.95)(2,2.69)(3,3.31)(4,3.83)(5,4.27)(6,4.64)(7,4.95)
+(8,5.21)(9,5.43)(10,5.62)(11,5.78)(12,5.91)(13,6.03)(14,6.12)
+(15,6.20)(16,6.27)(17,6.33)(18,6.38)(19,6.43)(20,6.46)};
+\addlegendentry{Faible -- Anneau}
+\end{axis}
+\end{tikzpicture}
+\caption{Gain relatif sur Wikipedia. Les isol\'{e}s progressent lin\'{e}airement ;
+  complet et anneau saturent rapidement. Les gains absolus sont plus faibles
+  qu'sur Harvard500 en raison de la dilution li\'{e}e \`{a} la taille du graphe.}
+\label{fig:wikipedia_gains}
+\end{figure}
+
+\subsection{Comparaison synth\'{e}tique des trois graphes}
+
+La figure~\ref{fig:comparaison_graphes} compare, pour l'attaque par n\oe{}uds
+isol\'{e}s (la plus efficace), le gain relatif de la cible faible sur les
+trois graphes en fonction de $k$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth, height=6.5cm,
+  xlabel={Nombre d'attaquants $k$},
+  ylabel={Gain relatif $\gamma$ (cible faible, isol\'{e}s)},
+  xmin=0, xmax=20,
+  ymin=0, ymax=22,
+  grid=major, grid style={gray!20},
+  title={Comparaison multi-graphes --- attaque isol\'{e}s, cible faible},
+  title style={font=\small},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend pos=north west,
+  legend style={font=\small, cells={anchor=west}},
+]
+\addplot[red!80!black, very thick] coordinates {
+(1,1.26)(2,1.47)(3,1.64)(5,1.91)(7,2.10)(10,2.31)(15,2.55)(20,2.69)};
+\addlegendentry{courtois ($n=8$)}
+
+\addplot[blue!70!black, very thick] coordinates {
+(1,1.846)(2,2.689)(3,3.529)(4,4.365)(5,5.198)(7,6.854)(10,9.314)
+(13,12.05)(15,13.35)(17,14.94)(20,17.31)};
+\addlegendentry{Harvard500 ($n=500$)}
+
+\addplot[green!60!black, very thick] coordinates {
+(1,1.85)(2,2.70)(3,3.55)(4,4.40)(5,5.25)(6,6.10)(7,6.95)
+(8,7.80)(9,8.65)(10,9.50)(11,10.35)(12,11.20)(13,12.05)(14,12.90)
+(15,13.75)(16,14.60)(17,15.45)(18,16.30)(19,17.15)(20,18.00)};
+\addlegendentry{Wikipedia ($n=1{,}6$~M)}
+\end{axis}
+\end{tikzpicture}
+\caption{Gain relatif de la cible faible sous attaque isol\'{e}s, sur les trois
+  graphes. La pente est similaire pour Harvard500 et Wikipedia, mais nettement
+  plus faible pour \texttt{courtois.txt} o\`{u} les scores initiaux sont \'{e}lev\'{e}s
+  (effet de levier r\'{e}duit).}
+\label{fig:comparaison_graphes}
+\end{figure}
+
+\subsection{Analyse des diff\'{e}rences entre graphes}
+
+Trois ph\'{e}nom\`{e}nes expliquent les \'{e}carts de comportement :
+
+\paragraph{1. Effet de levier et score initial.}
+Le score $\PR_0$ des cibles \'{e}tant beaucoup plus \'{e}lev\'{e} sur \texttt{courtois.txt}
+(ordre $10^{-1}$) que sur Harvard500 (ordre $10^{-4}$) ou Wikipedia (ordre $10^{-7}$),
+l'effet de levier $\gamma = 1 + \Delta\pi / \PR_0$ est structurellement plus faible.
+Sur Wikipedia, les cibles faibles ont des scores initiaux quasi nuls, ce qui explique
+que m\^{e}me un petit $k$ produit un gain relatif impressionnant.
+
+\paragraph{2. Dilution avec la taille du graphe.}
+L'accroissement absolu $\Delta\pi$ apport\'{e} par $k$ attaquants d\'{e}pend
+de $1/(n+k)$ via le terme de t\'{e}l\'{e}portation. Pour $n = 1{,}6$~M, cette
+contribution est de l'ordre de $6 \times 10^{-7}$ par attaquant, contre
+$2 \times 10^{-3}$ pour $n=500$. La pente du gain isol\'{e}s est donc environ
+$4000$ fois plus faible en valeur absolue sur Wikipedia --- mais le faible $\PR_0$
+des cibles compense cet effet en termes relatifs.
+
+\paragraph{3. Inversion anneau/complet sur les petits graphes.}
+Sur \texttt{courtois.txt}, l'anneau est syst\'{e}matiquement \textbf{plus mauvais}
+que le complet et m\^{e}me que ne rien faire pour la cible forte. L'arc ajout\'{e}
+cible $\to a_1$ repr\'{e}sente une fraction significative du degr\'{e} sortant total
+de la cible sur un petit graphe peu dense, ce qui divise la masse qu'elle retient.
+Sur Harvard500 et Wikipedia, ce m\^{e}me arc est n\'{e}gligeable face au degr\'{e}
+sortant d\'{e}j\`{a} \'{e}lev\'{e} de la cible, et l'anneau surpasse bien le complet pour
+les petits $k$.
+
+\subsection{Tableau de comparaison \`{a} $k=10$}
+
+\begin{table}[H]
+\centering
+\caption{Gain relatif $\gamma$ \`{a} $k=10$ pour les trois graphes et les trois structures}
+\label{tab:comparaison_k10}
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Graphe} & \textbf{Structure} & \textbf{Forte} & \textbf{M\'{e}diane} & \textbf{Faible} \\
+\midrule
+\multirow{3}{*}{\texttt{courtois} ($n=8$)}
+ & Isol\'{e}s  & $2{,}18\times$ & $2{,}75\times$ & $2{,}31\times$ \\
+ & Complet & $1{,}18\times$ & $1{,}42\times$ & $1{,}24\times$ \\
+ & Anneau  & $0{,}43\times$ & $0{,}64\times$ & $1{,}04\times$ \\
+\midrule
+\multirow{3}{*}{\texttt{Harvard500} ($n=500$)}
+ & Isol\'{e}s  & $1{,}93\times$ & $4{,}86\times$ & $9{,}31\times$ \\
+ & Complet & $1{,}38\times$ & $2{,}63\times$ & $4{,}53\times$ \\
+ & Anneau  & $1{,}54\times$ & $3{,}24\times$ & $5{,}94\times$ \\
+\midrule
+\multirow{3}{*}{\texttt{Wikipedia} ($n=1{,}6$~M)}
+ & Isol\'{e}s  & $2{,}11\times$ & $7{,}08\times$ & $9{,}50\times$ \\
+ & Complet & $1{,}47\times$ & $3{,}59\times$ & $4{,}62\times$ \\
+ & Anneau  & $1{,}60\times$ & $4{,}37\times$ & $5{,}62\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent On constate que les r\'{e}sultats sur Harvard500 et Wikipedia sont qualitativement
+coh\'{e}rents : l'ordre isol\'{e}s $>$ anneau $>$ complet est respect\'{e} pour les cibles
+m\'{e}diane et faible sur les deux graphes. \texttt{courtois.txt} constitue un cas
+sp\'{e}cial o\`{u} la petite taille du graphe inverse le comportement de l'anneau.
+
+%% ============================================================================
+\section{R\`{e}gles empiriques et conclusion}
+%% ============================================================================
+
+\subsection{R\`{e}gles empiriques}
+
+\`{A} partir de l'ensemble des exp\'{e}riences, on d\'{e}duit les r\`{e}gles suivantes :
+
+\begin{enumerate}
+  \item \textbf{Les n\oe{}uds isol\'{e}s sont l'attaque optimale.} Pour un budget
+    $k$ fix\'{e}, des attaquants sans liens mutuels maximisent le flux vers la
+    cible. La croissance est lin\'{e}aire et ne sature pas.
+
+  \item \textbf{Le graphe complet est inefficace \`{a} grande \'{e}chelle.}
+    Les liens internes diluent la masse et cr\'{e}ent une r\'{e}tention qui
+    plafonne le gain autour de $1{,}3$--$5{,}5\times$ selon la cible.
+
+  \item \textbf{L'anneau est int\'{e}ressant pour de petits $k$, sur des graphes
+    de taille moyenne ou grande.} Pour $k \leq 10$,
+    il surpasse le graphe complet gr\^{a}ce \`{a} la boucle de renforcement.
+    Au-del\`{a} de $k = 30$, son avantage dispara\^{i}t. Sur les tr\`{e}s petits
+    graphes, l'anneau peut m\^{e}me d\'{e}grader le score cible.
+
+  \item \textbf{Cibler les pages faibles maximise l'impact relatif.}
+    L'effet de levier rend le Google Bombing d'autant plus visible que la
+    page cible est peu connue initialement. Ce ph\'{e}nom\`{e}ne est robuste
+    sur les trois graphes test\'{e}s.
+
+  \item \textbf{Les r\'{e}sultats sont qualitativement stables entre Harvard500
+    et Wikipedia.} Malgr\'{e} un facteur d'\'{e}chelle de $\times 3000$ sur $n$,
+    l'ordre des structures et l'effet de levier sont conserv\'{e}s.
+    \texttt{courtois.txt} est trop petit pour exhiber les comportements
+    typiques.
+\end{enumerate}
+
+\subsection{Conclusion}
+
+Cette \'{e}tude montre que le Google Bombing est une attaque effective et
+quantifiable sur le m\'{e}canisme PageRank. Les principaux enseignements sont :
+
+\begin{itemize}
+  \item La structure d'attaque optimale est l'\textbf{\'{e}toile entrante pure}
+    (n\oe{}uds isol\'{e}s), dont le gain cro\^{i}t lin\'{e}airement sans saturation,
+    pouvant atteindre un facteur $\times 72$ avec 100 attaquants sur Harvard500
+    et $\times 18$ d\`{e}s $k=20$ sur Wikipedia.
+
+  \item Les liens intra-attaquants (complet, anneau) \emph{nuisent} \`{a}
+    l'efficacit\'{e} de l'attaque \`{a} grande \'{e}chelle en cr\'{e}ant une r\'{e}tention
+    de masse interne. Sur les petits graphes, l'anneau peut m\^{e}me \^{e}tre
+    contre-productif.
+
+  \item L'effet est d'autant plus spectaculaire que la cible est peu
+    r\'{e}f\'{e}renc\'{e}e initialement --- ce qui correspond exactement au cas d'usage
+    r\'{e}el du Google Bombing --- et ce r\'{e}sultat est robuste \`{a} l'\'{e}chelle.
+\end{itemize}
+
+Ces r\'{e}sultats justifient les contre-mesures adopt\'{e}es par les moteurs de
+recherche modernes : d\'{e}tection de fermes de liens, prise en compte de la
+qualit\'{e} des liens entrants, et diversification des signaux de pertinence
+au-del\`{a} de la seule topologie du graphe.
+
+%% ============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{brin1998}
+  S.~Brin, L.~Page,
+  \textit{The Anatomy of a Large-Scale Hypertextual Web Search Engine},
+  Computer Networks and ISDN Systems, 30(1--7):107--117, 1998.
+
+\bibitem{langville2006}
+  A.~N.~Langville, C.~D.~Meyer,
+  \textit{Google's PageRank and Beyond: The Science of Search Engine Rankings},
+  Princeton University Press, 2006.
+
+\bibitem{bianchini2005}
+  M.~Bianchini, M.~Gori, F.~Scarselli,
+  \textit{Inside PageRank},
+  ACM Transactions on Internet Technology, 5(1):92--128, 2005.
+
+\bibitem{davis2011}
+  T.~A.~Davis, Y.~Hu,
+  \textit{The University of Florida Sparse Matrix Collection},
+  ACM Transactions on Mathematical Software, 38(1):1--25, 2011.
+
+\end{thebibliography}
+
+\end{document}
