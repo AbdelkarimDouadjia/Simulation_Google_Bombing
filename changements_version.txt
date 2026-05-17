@@ -1,0 +1,5 @@
+Par rapport a lel version 9dima `googlebombing.c`, hadi version `googlebombing_final.c` rah plus propre, plus rapide w mratba pour rendu final.
+Zedt CSR optimise: le graphe ma rahouch matrice dense kbira, rah stocke ghir les arcs existants (`row_ptr`, `col_idx`, `val`), donc memoire w calcul ykono moins lourds surtout m3a les grands graphes.
+Zedt attaque virtuelle: ki nzido les attaquants, ma nrecopiwch le graphe kamel f memoire; le PageRank y7seb les liens d'attaque directement pendant le produit matrice-vecteur.
+Zedt support de plusieurs formats: Harvard, matrice creuse, Matrix Market `.mtx`, avec gestion des noeuds dangling w choix automatique des cibles forte/moyenne/faible.
+Zedt options utiles: `--prof-k` pour les valeurs demandees, `--k-step` pour accelerer les gros tests, `--alpha-sweep` pour comparer plusieurs alpha, avec export CSV final plus complet.
