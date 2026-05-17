@@ -1,798 +1,1241 @@
 /*
- * Google Bombing - Simulation complète
- * Usage : ./googlebombing <fichier.txt|fichier.mtx> [alpha] [k_max]
+ * Projet 7 - Simulation d'un Google Bombing
  *
- * Format .txt  (format original) :
- *   ligne 1 : n
- *   ligne 2 : m
- *   lignes  : <src> <deg> <dst1> <w1> <dst2> <w2> ...
+ * Version finale:
+ * - stockage creux CSR: adapte aux gros graphes du TP;
+ * - lecture de trois formats:
+ *     1) Harvard500: "n n m" puis m arcs "i j";
+ *     2) matrices creuses: "n m" puis lignes "i deg j1 w1 ...";
+ *     3) Matrix Market .mtx: "rows cols nnz" puis arcs "i j [poids]";
+ * - PageRank par iteration de puissance avec gestion des noeuds dangling;
+ * - attaque sans recopier tout le graphe: on superpose les attaquants pendant
+ *   le produit matrice-vecteur, ce qui evite une grosse consommation memoire;
+ * - balayage optionnel sur alpha pour etudier l'influence du facteur de
+ *   teleportation (parametre demande dans l'introduction du sujet);
+ * - sous-echantillonnage des valeurs de k pour rester rapide sur les
+ *   gros graphes tout en gardant une courbe lisible.
  *
- * Format .mtx  (Matrix Market, AJOUT TD) :
- *   lignes % : commentaires (ignorés)
- *   ligne    : rows cols nnz
- *   lignes   : i j [val]   (1-based, val optionnelle)
+ * Compilation:
+ *   gcc googlebombing_final.c -O2 -Wall -Wextra -o googlebombing_final.exe
+ *
+ * Usage:
+ *   googlebombing_final.exe [options] <fichier> <alpha> <k_max> <sortie.csv>
+ *
+ * Options:
+ *   --alpha-sweep "0.50,0.70,0.85,0.95" : lance plusieurs alpha (alpha argv ignore)
+ *   --prof-k                             : k = 1,2,5,10,20,50,100,200 (bornes par k_max)
+ *   --k-step <n>                         : ne teste que k = 1, 1+n, 1+2n, ..., k_max
+ *   --quiet                              : moins de logs
+ *
+ * Mettre k_max=0 ne fait que verifier la lecture du graphe.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <time.h>
 
-#define EPS           1e-6
-#define MAX_IT        200
-#define K_MAX_COMPLET 3000
+#define EPS 1e-10     /* seuil de convergence L1 pour l'iteration de puissance */
+#define MAX_IT 1000   /* nombre maximum d'iterations PageRank avant arret force */
+#define MAX_ALPHAS 32 /* nombre maximum de valeurs d'alpha dans un alpha-sweep  */
 
-/* =========================================================
- *  Structure CSR  (inchangée)
- * ========================================================= */
-typedef struct {
-    int     n;
-    int     m;
-    int    *row_ptr;
-    int    *col_idx;
-    double *val;
+typedef enum
+{
+    FORMAT_EDGE_LIST,
+    FORMAT_WEIGHTED_ROWS,
+    FORMAT_MATRIX_MARKET
+} InputFormat;
+
+typedef enum
+{
+    ATTACK_ISOLATED = 0, /* chaque attaquant pointe uniquement vers la cible */
+    ATTACK_COMPLETE = 1, /* graphe complet entre attaquants + cible           */
+    ATTACK_RING = 2      /* anneau: cible -> a0 -> a1 -> ... -> ak -> cible   */
+} AttackType;
+
+typedef enum
+{
+    TARGET_FORTE = 0,  /* noeud de PageRank maximal  */
+    TARGET_MOYENNE = 1,/* noeud median               */
+    TARGET_FAIBLE = 2  /* noeud de PageRank minimal  */
+} TargetKind;
+
+/* Graphe oriente stocke au format CSR (Compressed Sparse Row).
+ * row_ptr[i]..row_ptr[i+1]-1 donne les arcs sortants du noeud i.
+ * val[p] est le poids stochastique de l'arc col_idx[p] (deja normalise
+ * par la somme des poids sortants de la ligne). */
+typedef struct
+{
+    int n;       /* nombre de noeuds                */
+    int m;       /* nombre d'arcs                   */
+    int *row_ptr;/* tableau de pointeurs de lignes (taille n+1) */
+    int *col_idx;/* colonnes des arcs (taille m)    */
+    double *val; /* poids stochastiques (taille m)  */
 } Graph;
 
-/* =========================================================
- *  [AJOUT TD1 Q1] Matrice dense  (représentation pleine N×N)
- *  Utilisée pour vérification sur petits graphes.
- * ========================================================= */
-typedef struct {
-    int     n;
-    double **data;   /* data[i][j] = proba de transition i -> j */
-} DenseMatrix;
+typedef struct
+{
+    int node;
+    double score;
+} RankedNode;
 
-/* Alloue une matrice dense N×N initialisée à 0 */
-DenseMatrix dense_alloc(int n) {
-    DenseMatrix d;
-    d.n    = n;
-    d.data = malloc(n * sizeof(double *));
-    for (int i = 0; i < n; i++) {
-        d.data[i] = calloc(n, sizeof(double));
+typedef struct
+{
+    double score;     /* PageRank de la cible apres convergence */
+    int iterations;   /* nombre d'iterations effectuees         */
+    double seconds;   /* temps CPU en secondes                  */
+} PageRankRun;
+
+typedef struct
+{
+    int verbose;
+    int k_step;
+    int professor_k;
+    int n_alphas;
+    double alphas[MAX_ALPHAS];
+} RunOptions;
+
+/* Arc brut avant construction CSR (format intermediaire de lecture MTX). */
+typedef struct
+{
+    int src;
+    int dst;
+    double weight;
+} RawEdge;
+
+/* --- Utilitaires memoire -------------------------------------------------- */
+
+/* Alloue n*size octets initialises a zero; arrete le programme si echec. */
+static void *xcalloc(size_t n, size_t size)
+{
+    void *p = calloc(n, size);
+    if (!p)
+    {
+        fprintf(stderr, "Erreur allocation memoire\n");
+        exit(EXIT_FAILURE);
     }
-    return d;
+    return p;
 }
 
-/* Libère une matrice dense */
-void dense_free(DenseMatrix *d) {
-    for (int i = 0; i < d->n; i++) free(d->data[i]);
-    free(d->data);
-    d->data = NULL;
-}
-
-/*
- * Construit la matrice Google dense à partir du graphe CSR.
- * G = alpha * P + (1-alpha)/n * E  avec gestion des dangling nodes.
- *   P[i][j] = val si arc i->j, colonne uniforme 1/n si noeud sans sortie.
- */
-DenseMatrix csr_to_dense_google(const Graph *g, double alpha) {
-    int n = g->n;
-    DenseMatrix d = dense_alloc(n);
-
-    for (int i = 0; i < n; i++) {
-        int deg = g->row_ptr[i+1] - g->row_ptr[i];
-        if (deg == 0) {
-            /* dangling : surfer téléporte uniformément */
-            for (int j = 0; j < n; j++)
-                d.data[i][j] = 1.0 / n;
-        } else {
-            for (int k = g->row_ptr[i]; k < g->row_ptr[i+1]; k++)
-                d.data[i][g->col_idx[k]] = alpha * g->val[k];
-            for (int j = 0; j < n; j++)
-                d.data[i][j] += (1.0 - alpha) / n;
-        }
+/* Alloue size octets non initialises; arrete le programme si echec. */
+static void *xmalloc(size_t size)
+{
+    void *p = malloc(size);
+    if (!p)
+    {
+        fprintf(stderr, "Erreur allocation memoire\n");
+        exit(EXIT_FAILURE);
     }
-    return d;
+    return p;
 }
 
-/*
- * Affiche la matrice dense (pour petits graphes, n <= 20 conseillé).
- */
-void dense_afficher(const DenseMatrix *d) {
-    printf("Matrice Google dense (%d x %d) :\n", d->n, d->n);
-    for (int i = 0; i < d->n; i++) {
-        printf("  [");
-        for (int j = 0; j < d->n; j++)
-            printf(" %6.4f", d->data[i][j]);
-        printf(" ]\n");
+/* --- Lecture et detection de format --------------------------------------- */
+
+/* Compte les valeurs numeriques consecutives sur une ligne de texte.
+ * Sert a distinguer "n n m" (edge-list) de "n m" (matrice creuse). */
+static int count_numbers(const char *line)
+{
+    int count = 0;
+    const char *p = line;
+    char *end = NULL;
+
+    while (*p)
+    {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        strtod(p, &end);
+        if (end == p)
+            break;
+        count++;
+        p = end;
     }
+    return count;
 }
 
-/*
- * [AJOUT TD1 Q1] Produit vecteur × matrice dense  O(N²)
- * res[j] = sum_i pi[i] * G[i][j]
- */
-void mult_vect_mat_dense(const double *pi, const DenseMatrix *d, double *res) {
-    int n = d->n;
-    for (int j = 0; j < n; j++) {
-        res[j] = 0.0;
-        for (int i = 0; i < n; i++)
-            res[j] += pi[i] * d->data[i][j];
+/* Detecte le format du fichier en lisant uniquement la premiere ligne.
+ * Retourne FORMAT_MATRIX_MARKET si le commentaire MatrixMarket est present,
+ * FORMAT_EDGE_LIST si la ligne contient 3 entiers (n n m), sinon FORMAT_WEIGHTED_ROWS. */
+static InputFormat detect_format(const char *filename)
+{
+    FILE *f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Erreur ouverture fichier %s\n", filename);
+        exit(EXIT_FAILURE);
     }
+
+    char line[4096];
+    if (!fgets(line, sizeof(line), f))
+    {
+        fprintf(stderr, "Erreur: fichier vide\n");
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    fclose(f);
+
+    if (strstr(line, "MatrixMarket") != NULL || strstr(line, "matrixmarket") != NULL)
+    {
+        return FORMAT_MATRIX_MARKET;
+    }
+
+    return (count_numbers(line) >= 3) ? FORMAT_EDGE_LIST : FORMAT_WEIGHTED_ROWS;
 }
 
-/* =========================================================
- *  Prototypes
- * ========================================================= */
-double *pagerank(const Graph *g, double alpha, int verbose);
-Graph attaque_isoles(const Graph *g, int k, int target);
-Graph attaque_complet(const Graph *g, int k, int target);
-Graph attaque_anneau(const Graph *g, int k, int target);
-
-/* =========================================================
- *  Utilitaires  (inchangés)
- * ========================================================= */
-double norme_L1(const double *a, const double *b, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n; i++) s += fabs(a[i] - b[i]);
-    return s;
-}
-
-void free_graph(Graph *g) {
+/* Libere les tableaux internes d'un graphe CSR et remet les champs a zero. */
+static void free_graph(Graph *g)
+{
+    if (!g)
+        return;
     free(g->row_ptr);
     free(g->col_idx);
     free(g->val);
     g->row_ptr = NULL;
     g->col_idx = NULL;
-    g->val     = NULL;
+    g->val = NULL;
+    g->n = 0;
+    g->m = 0;
 }
 
-/* =========================================================
- *  Lecture du graphe — format .txt original  (inchangée)
- * ========================================================= */
-Graph lire_graphe_txt(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) {
-        fprintf(stderr, "Erreur: impossible d'ouvrir %s\n", filename);
-        exit(1);
+/* Agrandit le tableau counts jusqu'a pouvoir contenir l'indice needed_index.
+ * Les nouvelles cases sont initialisees a zero.
+ * Utilise un doublement de capacite pour amortir les reallocs. */
+static void ensure_counts_capacity(int **counts, int *capacity, int needed_index)
+{
+    if (needed_index < *capacity)
+        return;
+
+    int old_capacity = *capacity;
+    int new_capacity = old_capacity > 0 ? old_capacity : 1024;
+    while (needed_index >= new_capacity)
+    {
+        if (new_capacity > 1073741823 / 2)
+        {
+            fprintf(stderr, "Erreur: trop de sommets\n");
+            exit(EXIT_FAILURE);
+        }
+        new_capacity *= 2;
     }
 
+    int *new_counts = realloc(*counts, (size_t)new_capacity * sizeof(int));
+    if (!new_counts)
+    {
+        fprintf(stderr, "Erreur realloc\n");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = old_capacity; i < new_capacity; i++)
+        new_counts[i] = 0;
+    *counts = new_counts;
+    *capacity = new_capacity;
+}
+
+/* Lit l'en-tete format edge-list: "n n m" (deux fois le nombre de noeuds
+ * puis le nombre d'arcs). Arrete si le parsing echoue. */
+static void read_edge_header(FILE *f, int *declared_n, int *declared_m)
+{
+    int n2;
+    if (fscanf(f, "%d %d %d", declared_n, &n2, declared_m) != 3)
+    {
+        fprintf(stderr, "Erreur lecture en-tete edge-list\n");
+        exit(EXIT_FAILURE);
+    }
+    if (*declared_n != n2)
+    {
+        fprintf(stderr, "Attention: en-tete non carree (%d, %d)\n", *declared_n, n2);
+    }
+}
+
+/* Lit l'en-tete format matrice creuse: "n m" sur une ou deux lignes.
+ * Supporte le cas ou n et m sont sur des lignes separees. */
+static void read_weighted_header(FILE *f, int *declared_n, int *declared_m)
+{
+    char first[4096], second[4096];
+    int nums_first;
+
+    if (!fgets(first, sizeof(first), f))
+    {
+        fprintf(stderr, "Erreur lecture premiere ligne\n");
+        exit(EXIT_FAILURE);
+    }
+    nums_first = count_numbers(first);
+
+    if (nums_first >= 2)
+    {
+        if (sscanf(first, "%d %d", declared_n, declared_m) != 2)
+        {
+            fprintf(stderr, "Erreur lecture en-tete matrice creuse\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    else
+    {
+        if (sscanf(first, "%d", declared_n) != 1 || !fgets(second, sizeof(second), f) ||
+            sscanf(second, "%d", declared_m) != 1)
+        {
+            fprintf(stderr, "Erreur lecture en-tete matrice creuse\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+/* Construit un graphe CSR a partir d'un fichier Matrix Market (.mtx).
+ * Gere les matrices symetriques (duplication des arcs), les poids optionnels
+ * et la normalisation stochastique ligne par ligne. */
+static Graph read_matrix_market_graph(const char *filename)
+{
+    FILE *f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Erreur ouverture fichier %s\n", filename);
+        exit(EXIT_FAILURE);
+    }
+
+    char line[4096];
+    int symmetric = 0;
+    int rows = 0, cols = 0, nnz = 0;
+
+    /* Premiere ligne: banniere MatrixMarket (detecte la symetrie). */
+    if (!fgets(line, sizeof(line), f))
+    {
+        fprintf(stderr, "Erreur: fichier MTX vide\n");
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    if (strstr(line, "symmetric") != NULL || strstr(line, "SYMMETRIC") != NULL)
+    {
+        symmetric = 1;
+    }
+
+    /* Sauter les lignes de commentaires (commencant par '%'). */
+    do
+    {
+        if (!fgets(line, sizeof(line), f))
+        {
+            fprintf(stderr, "Erreur: dimensions MTX introuvables\n");
+            fclose(f);
+            exit(EXIT_FAILURE);
+        }
+    } while (line[0] == '%');
+
+    if (sscanf(line, "%d %d %d", &rows, &cols, &nnz) != 3)
+    {
+        fprintf(stderr, "Erreur: en-tete MTX invalide\n");
+        fclose(f);
+        exit(EXIT_FAILURE);
+    }
+    if (rows != cols)
+    {
+        fprintf(stderr, "Attention: matrice MTX non carree (%d, %d); n=max\n", rows, cols);
+    }
+
+    int n = rows > cols ? rows : cols;
+    int capacity = nnz * (symmetric ? 2 : 1);
+    RawEdge *edges = xmalloc((size_t)capacity * sizeof(RawEdge));
+    int *row_counts = xcalloc((size_t)n, sizeof(int));
+    double *row_sums = xcalloc((size_t)n, sizeof(double));
+    int m = 0;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        if (line[0] == '%')
+            continue;
+
+        int src = 0, dst = 0;
+        double weight = 1.0;
+        int read = sscanf(line, "%d %d %lf", &src, &dst, &weight);
+        if (read < 2)
+            continue;
+        if (src <= 0 || src > n || dst <= 0 || dst > n)
+        {
+            fprintf(stderr, "Erreur: arc MTX invalide %d -> %d (n=%d)\n", src, dst, n);
+            fclose(f);
+            free(edges);
+            free(row_counts);
+            free(row_sums);
+            exit(EXIT_FAILURE);
+        }
+        if (weight < 0.0)
+        {
+            fprintf(stderr, "Erreur: poids MTX negatif sur %d -> %d\n", src, dst);
+            fclose(f);
+            free(edges);
+            free(row_counts);
+            free(row_sums);
+            exit(EXIT_FAILURE);
+        }
+
+        /* Agrandissement dynamique du tableau d'arcs bruts si necessaire. */
+        if (m >= capacity)
+        {
+            capacity = capacity > 0 ? capacity * 2 : 1024;
+            RawEdge *tmp = realloc(edges, (size_t)capacity * sizeof(RawEdge));
+            if (!tmp)
+            {
+                fprintf(stderr, "Erreur realloc MTX\n");
+                fclose(f);
+                free(edges);
+                free(row_counts);
+                free(row_sums);
+                exit(EXIT_FAILURE);
+            }
+            edges = tmp;
+        }
+        edges[m].src = src - 1;
+        edges[m].dst = dst - 1;
+        edges[m].weight = weight;
+        row_counts[src - 1]++;
+        row_sums[src - 1] += weight;
+        m++;
+
+        /* Pour une matrice symetrique, on ajoute l'arc inverse (sauf boucles). */
+        if (symmetric && src != dst)
+        {
+            if (m >= capacity)
+            {
+                capacity = capacity > 0 ? capacity * 2 : 1024;
+                RawEdge *tmp = realloc(edges, (size_t)capacity * sizeof(RawEdge));
+                if (!tmp)
+                {
+                    fprintf(stderr, "Erreur realloc MTX\n");
+                    fclose(f);
+                    free(edges);
+                    free(row_counts);
+                    free(row_sums);
+                    exit(EXIT_FAILURE);
+                }
+                edges = tmp;
+            }
+            edges[m].src = dst - 1;
+            edges[m].dst = src - 1;
+            edges[m].weight = weight;
+            row_counts[dst - 1]++;
+            row_sums[dst - 1] += weight;
+            m++;
+        }
+    }
+    fclose(f);
+
+    /* Construction du CSR: row_ptr puis placement des arcs normalises. */
     Graph g;
-    if (fscanf(f, "%d", &g.n) != 1) { fprintf(stderr, "Erreur lecture n\n"); exit(1); }
-    if (fscanf(f, "%d", &g.m) != 1) { fprintf(stderr, "Erreur lecture m\n"); exit(1); }
+    g.n = n;
+    g.m = m;
+    g.row_ptr = xcalloc((size_t)g.n + 1, sizeof(int));
+    g.col_idx = xmalloc((size_t)g.m * sizeof(int));
+    g.val = xmalloc((size_t)g.m * sizeof(double));
 
-    g.row_ptr = calloc(g.n + 1, sizeof(int));
-    g.col_idx = malloc(g.m * sizeof(int));
-    g.val     = malloc(g.m * sizeof(double));
+    for (int i = 0; i < g.n; i++)
+    {
+        g.row_ptr[i + 1] = g.row_ptr[i] + row_counts[i];
+    }
 
-    fprintf(stderr, "Allocation OK: %.1f Mo\n",
-        (g.m * (double)(sizeof(int) + sizeof(double)) + g.n * sizeof(int)) / 1e6);
-    if (!g.row_ptr || !g.col_idx || !g.val) { fprintf(stderr, "Erreur allocation\n"); exit(1); }
+    int *cursor = xcalloc((size_t)g.n, sizeof(int));
+    for (int e = 0; e < m; e++)
+    {
+        int src = edges[e].src;
+        int pos = g.row_ptr[src] + cursor[src]++;
+        g.col_idx[pos] = edges[e].dst;
+        /* Normalisation: poids = w_ij / somme des poids sortants de i. */
+        g.val[pos] = row_sums[src] > 0.0 ? edges[e].weight / row_sums[src] : 0.0;
+    }
 
-    int pos = 0;
-    g.row_ptr[0] = 0;
-    for (int i = 0; i < g.n; i++) {
+    if (nnz != 0 && !symmetric && nnz != m)
+    {
+        fprintf(stderr, "Attention: nnz MTX declare=%d, arcs lus=%d\n", nnz, m);
+    }
+
+    free(cursor);
+    free(row_counts);
+    free(row_sums);
+    free(edges);
+    return g;
+}
+
+/* Lit un graphe depuis un fichier texte (edge-list ou matrice creuse ponderee)
+ * et construit la representation CSR en deux passes:
+ *   1re passe: comptage des degres sortants pour dimensionner row_ptr;
+ *   2e passe: remplissage de col_idx et val avec les poids normalises.
+ * Pour l'edge-list, chaque arc a le poids uniforme 1/deg. */
+static Graph read_graph(const char *filename)
+{
+    InputFormat fmt = detect_format(filename);
+    if (fmt == FORMAT_MATRIX_MARKET)
+    {
+        return read_matrix_market_graph(filename);
+    }
+
+    FILE *f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Erreur ouverture fichier %s\n", filename);
+        exit(EXIT_FAILURE);
+    }
+
+    int declared_n = 0, declared_m = 0;
+    int max_id = 0;
+    int edge_count = 0;
+    int capacity = 0;
+    int *row_counts = NULL;
+
+    if (fmt == FORMAT_EDGE_LIST)
+    {
+        read_edge_header(f, &declared_n, &declared_m);
+    }
+    else
+    {
+        read_weighted_header(f, &declared_n, &declared_m);
+    }
+
+    ensure_counts_capacity(&row_counts, &capacity, declared_n + 1);
+    max_id = declared_n;
+
+    /* --- 1re passe: comptage des degres sortants --- */
+    if (fmt == FORMAT_EDGE_LIST)
+    {
+        int src, dst;
+        while (fscanf(f, "%d %d", &src, &dst) == 2)
+        {
+            if (src <= 0 || dst <= 0)
+            {
+                fprintf(stderr, "Erreur: indices invalides dans %s\n", filename);
+                free(row_counts);
+                fclose(f);
+                exit(EXIT_FAILURE);
+            }
+            if (src > max_id)
+                max_id = src;
+            if (dst > max_id)
+                max_id = dst;
+            ensure_counts_capacity(&row_counts, &capacity, src);
+            row_counts[src - 1]++;
+            edge_count++;
+        }
+    }
+    else
+    {
         int src, deg;
-        if (fscanf(f, "%d %d", &src, &deg) != 2) {
-            fprintf(stderr, "Erreur lecture noeud %d\n", i); exit(1);
-        }
-        for (int j = 0; j < deg; j++) {
-            int    dst;
-            double w;
-            if (fscanf(f, "%d %lf", &dst, &w) != 2) {
-                fprintf(stderr, "Erreur lecture arc noeud %d\n", i); exit(1);
+        while (fscanf(f, "%d %d", &src, &deg) == 2)
+        {
+            if (src <= 0 || deg < 0)
+            {
+                fprintf(stderr, "Erreur: ligne invalide dans %s\n", filename);
+                free(row_counts);
+                fclose(f);
+                exit(EXIT_FAILURE);
             }
-            if (dst < 1 || dst > g.n) {
-                fprintf(stderr, "Arc invalide: src=%d dst=%d (n=%d)\n", i+1, dst, g.n);
-                exit(1);
+            if (src > max_id)
+                max_id = src;
+            ensure_counts_capacity(&row_counts, &capacity, src);
+            row_counts[src - 1] += deg;
+
+            for (int e = 0; e < deg; e++)
+            {
+                int dst;
+                double w;
+                if (fscanf(f, "%d %lf", &dst, &w) != 2)
+                {
+                    fprintf(stderr, "Erreur: arc pondere invalide dans %s\n", filename);
+                    free(row_counts);
+                    fclose(f);
+                    exit(EXIT_FAILURE);
+                }
+                if (dst <= 0)
+                {
+                    fprintf(stderr, "Erreur: destination invalide dans %s\n", filename);
+                    free(row_counts);
+                    fclose(f);
+                    exit(EXIT_FAILURE);
+                }
+                if (dst > max_id)
+                    max_id = dst;
+                edge_count++;
             }
-            g.col_idx[pos] = dst - 1;
-            g.val[pos]     = w;
-            pos++;
         }
-        g.row_ptr[i + 1] = pos;
     }
     fclose(f);
-    g.m = pos;
+
+    if (max_id > capacity)
+        ensure_counts_capacity(&row_counts, &capacity, max_id);
+
+    /* Allocation du CSR a partir des comptages. */
+    Graph g;
+    g.n = max_id;
+    g.m = edge_count;
+    g.row_ptr = xcalloc((size_t)g.n + 1, sizeof(int));
+    g.col_idx = xmalloc((size_t)g.m * sizeof(int));
+    g.val = xmalloc((size_t)g.m * sizeof(double));
+
+    for (int i = 0; i < g.n; i++)
+    {
+        g.row_ptr[i + 1] = g.row_ptr[i] + row_counts[i];
+    }
+
+    /* --- 2e passe: remplissage des colonnes et des poids --- */
+    int *cursor = xcalloc((size_t)g.n, sizeof(int));
+    f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Erreur reouverture fichier %s\n", filename);
+        free(cursor);
+        free(row_counts);
+        free_graph(&g);
+        exit(EXIT_FAILURE);
+    }
+    if (fmt == FORMAT_EDGE_LIST)
+    {
+        read_edge_header(f, &declared_n, &declared_m);
+        int src, dst;
+        while (fscanf(f, "%d %d", &src, &dst) == 2)
+        {
+            int row = src - 1;
+            int pos = g.row_ptr[row] + cursor[row]++;
+            g.col_idx[pos] = dst - 1;
+        }
+        /* Poids uniforme 1/deg pour l'edge-list (matrice stochastique). */
+        for (int i = 0; i < g.n; i++)
+        {
+            int deg = g.row_ptr[i + 1] - g.row_ptr[i];
+            for (int p = g.row_ptr[i]; p < g.row_ptr[i + 1]; p++)
+            {
+                g.val[p] = deg > 0 ? 1.0 / deg : 0.0;
+            }
+        }
+    }
+    else
+    {
+        read_weighted_header(f, &declared_n, &declared_m);
+        int src, deg;
+        while (fscanf(f, "%d %d", &src, &deg) == 2)
+        {
+            int row = src - 1;
+            for (int e = 0; e < deg; e++)
+            {
+                int dst;
+                double w;
+                if (fscanf(f, "%d %lf", &dst, &w) != 2)
+                {
+                    fprintf(stderr, "Erreur seconde lecture dans %s\n", filename);
+                    free(cursor);
+                    free(row_counts);
+                    free_graph(&g);
+                    fclose(f);
+                    exit(EXIT_FAILURE);
+                }
+                int pos = g.row_ptr[row] + cursor[row]++;
+                g.col_idx[pos] = dst - 1;
+                g.val[pos] = w;
+            }
+        }
+    }
+    fclose(f);
+
+    free(cursor);
+    free(row_counts);
+
+    if (declared_m != 0 && declared_m != edge_count)
+    {
+        fprintf(stderr, "Attention: m declare=%d, arcs lus=%d\n", declared_m, edge_count);
+    }
+    if (declared_n != g.n)
+    {
+        fprintf(stderr, "Attention: n declare=%d, max indice lu=%d; n corrige a %d\n",
+                declared_n, g.n, g.n);
+    }
+
     return g;
 }
 
-/* =========================================================
- *  [AJOUT TD] Lecture du graphe — format Matrix Market (.mtx)
- *
- *  Gère :
- *    - lignes de commentaires commençant par '%'
- *    - en-tête "rows cols nnz"
- *    - arcs "i j [val]"  (indices 1-based → 0-based)
- *    - poids uniforme 1/deg si pas de valeur dans le fichier
- * ========================================================= */
-Graph lire_graphe_mtx(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) {
-        fprintf(stderr, "Erreur: impossible d'ouvrir %s\n", filename);
-        exit(1);
-    }
+/* --- PageRank ------------------------------------------------------------- */
 
-    /* Sauter les lignes de commentaires % */
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] != '%') break;
-    }
+/* Norme L1 de la difference entre deux vecteurs de taille n.
+ * Utilisee comme critere d'arret de l'iteration de puissance. */
+static double l1_diff(const double *a, const double *b, int n)
+{
+    double s = 0.0;
+    for (int i = 0; i < n; i++)
+        s += fabs(a[i] - b[i]);
+    return s;
+}
 
-    /* L'en-tête est dans `line` : rows cols nnz */
-    int rows, cols, nnz;
-    if (sscanf(line, "%d %d %d", &rows, &cols, &nnz) != 3) {
-        fprintf(stderr, "Erreur: en-tête MTX invalide\n");
-        exit(1);
-    }
+/* Un pas du surfeur aleatoire sur le graphe de base (sans attaquants).
+ * Formule: next[j] = alpha * sum_i(pi[i] * P[i][j])
+ *                  + (1-alpha)/n + alpha * dangling/n
+ * Les noeuds dangling (degre sortant nul) redistribuent leur masse
+ * uniformement sur tous les noeuds (variante "dangling node handling"). */
+static void multiply_base(const Graph *g, const double *pi, double alpha, double *next)
+{
+    double dangling = 0.0;
+    for (int i = 0; i < g->n; i++)
+        next[i] = 0.0;
 
-    int n = rows;   /* graphe carré */
-
-    /* Lecture brute des arcs (1-based) */
-    int    *src_arr = malloc(nnz * sizeof(int));
-    int    *dst_arr = malloc(nnz * sizeof(int));
-    double *w_arr   = malloc(nnz * sizeof(double));
-    if (!src_arr || !dst_arr || !w_arr) { fprintf(stderr, "Erreur alloc MTX\n"); exit(1); }
-
-    int *deg_out = calloc(n, sizeof(int));
-
-    int pos = 0;
-    while (pos < nnz && fgets(line, sizeof(line), f)) {
-        if (line[0] == '%') continue;
-        int i, j;
-        double v = 1.0;
-        int r = sscanf(line, "%d %d %lf", &i, &j, &v);
-        if (r < 2) continue;
-        if (i < 1 || i > n || j < 1 || j > n) {
-            fprintf(stderr, "Arc MTX invalide: %d %d (n=%d)\n", i, j, n);
-            exit(1);
+    for (int i = 0; i < g->n; i++)
+    {
+        int begin = g->row_ptr[i];
+        int end = g->row_ptr[i + 1];
+        if (begin == end)
+        {
+            dangling += pi[i];
         }
-        src_arr[pos] = i - 1;
-        dst_arr[pos] = j - 1;
-        w_arr[pos]   = v;
-        deg_out[i - 1]++;
-        pos++;
-    }
-    int m = pos;
-    fclose(f);
-
-    /* Normaliser les poids par le degré sortant (si val = 1.0 partout) */
-    for (int k = 0; k < m; k++) {
-        int s = src_arr[k];
-        if (deg_out[s] > 0)
-            w_arr[k] = 1.0 / deg_out[s];
+        else
+        {
+            for (int p = begin; p < end; p++)
+            {
+                next[g->col_idx[p]] += alpha * pi[i] * g->val[p];
+            }
+        }
     }
 
-    /* Construction CSR */
-    Graph g;
-    g.n       = n;
-    g.m       = m;
-    g.row_ptr = calloc(n + 1, sizeof(int));
-    g.col_idx = malloc(m * sizeof(int));
-    g.val     = malloc(m * sizeof(double));
+    double uniform = (1.0 - alpha) / g->n + alpha * dangling / g->n;
+    for (int i = 0; i < g->n; i++)
+        next[i] += uniform;
+}
 
-    /* Compte des arcs par ligne (source) */
-    for (int k = 0; k < m; k++) g.row_ptr[src_arr[k] + 1]++;
-    for (int i = 0; i < n; i++) g.row_ptr[i+1] += g.row_ptr[i];
+/* Retourne le temps ecoule en secondes depuis start (horloge CPU). */
+static double seconds_since(clock_t start)
+{
+    clock_t now = clock();
+    return (double)(now - start) / CLOCKS_PER_SEC;
+}
 
-    int *cursor = calloc(n, sizeof(int));
-    for (int k = 0; k < m; k++) {
-        int s = src_arr[k];
-        int p = g.row_ptr[s] + cursor[s];
-        g.col_idx[p] = dst_arr[k];
-        g.val[p]     = w_arr[k];
-        cursor[s]++;
-    }
+/* Calcule le PageRank du graphe de base par iteration de puissance.
+ * Demarre d'une distribution uniforme et itere jusqu'a convergence L1 < EPS
+ * ou MAX_IT iterations. Ecrit le vecteur converge dans pr (taille g->n). */
+static PageRankRun pagerank_base(const Graph *g, double alpha, double *pr)
+{
+    double *cur = xmalloc((size_t)g->n * sizeof(double));
+    double *next = xcalloc((size_t)g->n, sizeof(double));
+    for (int i = 0; i < g->n; i++)
+        cur[i] = 1.0 / g->n;
 
-    free(src_arr); free(dst_arr); free(w_arr);
-    free(deg_out); free(cursor);
+    clock_t t0 = clock();
+    int iter = 0;
+    double diff;
+    do
+    {
+        multiply_base(g, cur, alpha, next);
+        diff = l1_diff(cur, next, g->n);
+        double *tmp = cur;
+        cur = next;
+        next = tmp;
+        iter++;
+    } while (diff > EPS && iter < MAX_IT);
 
-    fprintf(stderr, "MTX chargé: n=%d m=%d\n", g.n, g.m);
-    return g;
+    memcpy(pr, cur, (size_t)g->n * sizeof(double));
+    free(cur);
+    free(next);
+
+    PageRankRun run = {0.0, iter, seconds_since(t0)};
+    return run;
 }
 
 /*
- * Dispatcher : choisit le parser selon l'extension du fichier.
+ * Multiplication "augmentee" : produit matrice-vecteur du graphe etendu
+ * (n base + k attaquants) sans materialiser la matrice etendue.
+ *
+ * Conventions:
+ * - ATTACK_ISOLATED : chaque attaquant pointe uniquement vers la cible (1 arc).
+ * - ATTACK_COMPLETE : chaque attaquant pointe vers les k-1 autres + la cible (k arcs).
+ * - ATTACK_RING     : cycle target -> attaquant_0 -> ... -> attaquant_{k-1} -> target.
+ *                     La cible conserve ses arcs existants ; l'arc supplementaire
+ *                     vers attaquant_0 fait passer ses poids sortants de 1/deg a
+ *                     1/(deg+1). Si la cible etait dangling, elle ne contribue
+ *                     plus au surfeur aleatoire mais a attaquant_0 (1 arc).
+ *
+ * Le vecteur pi est de taille total_n = base_n + k:
+ *   pi[0..base_n-1]          : noeuds du graphe original
+ *   pi[base_n..total_n-1]    : attaquants
  */
-Graph lire_graphe(const char *filename) {
-    const char *ext = strrchr(filename, '.');
-    if (ext && strcmp(ext, ".mtx") == 0)
-        return lire_graphe_mtx(filename);
-    return lire_graphe_txt(filename);
-}
+static void multiply_attack(const Graph *g, const double *pi, double alpha,
+                            AttackType type, int target, int k, double *next)
+{
+    int base_n = g->n;
+    int total_n = base_n + k;
+    int first_attacker = base_n;
+    double dangling = 0.0;
 
-/* =========================================================
- *  Multiplication vecteur x matrice Google (CSR)  (inchangée)
- * ========================================================= */
-void mult_vect_mat_csr(const double *pi, const Graph *g, double alpha, double *res) {
-    int n = g->n;
-    for (int j = 0; j < n; j++) res[j] = 0.0;
+    for (int i = 0; i < total_n; i++)
+        next[i] = 0.0;
 
-    double dangling_mass = 0.0;
-    for (int i = 0; i < n; i++) {
-        int deg = g->row_ptr[i+1] - g->row_ptr[i];
-        if (deg == 0) {
-            dangling_mass += alpha * pi[i] / n;
-        } else {
-            for (int k = g->row_ptr[i]; k < g->row_ptr[i+1]; k++)
-                res[g->col_idx[k]] += alpha * pi[i] * g->val[k];
+    /* Contribution des noeuds du graphe de base. */
+    for (int i = 0; i < base_n; i++)
+    {
+        int begin = g->row_ptr[i];
+        int end = g->row_ptr[i + 1];
+        int deg = end - begin;
+
+        if (type == ATTACK_RING && i == target)
+        {
+            /* La cible redirige une fraction de sa masse vers le premier attaquant
+             * (nouvel arc sortant), en rescalant ses arcs existants en 1/(deg+1). */
+            if (deg == 0)
+            {
+                next[first_attacker] += alpha * pi[i];
+            }
+            else
+            {
+                double old_scale = (double)deg / (double)(deg + 1);
+                for (int p = begin; p < end; p++)
+                {
+                    next[g->col_idx[p]] += alpha * pi[i] * g->val[p] * old_scale;
+                }
+                next[first_attacker] += alpha * pi[i] / (double)(deg + 1);
+            }
+        }
+        else if (deg == 0)
+        {
+            dangling += pi[i];
+        }
+        else
+        {
+            for (int p = begin; p < end; p++)
+            {
+                next[g->col_idx[p]] += alpha * pi[i] * g->val[p];
+            }
         }
     }
 
-    double uniform = (1.0 - alpha) / n + dangling_mass;
-    for (int j = 0; j < n; j++)
-        res[j] += uniform;
+    /* Contribution des noeuds attaquants selon le type d'attaque. */
+    double attack_mass = 0.0;
+    for (int a = 0; a < k; a++)
+        attack_mass += pi[first_attacker + a];
+
+    if (type == ATTACK_ISOLATED)
+    {
+        /* Tous les attaquants pointent vers la cible: toute la masse va a target. */
+        next[target] += alpha * attack_mass;
+    }
+    else if (type == ATTACK_COMPLETE)
+    {
+        /* Graphe complet: chaque attaquant distribue egalement vers la cible
+         * et les k-1 autres attaquants (poids 1/k par arc). */
+        double w = 1.0 / k;
+        next[target] += alpha * attack_mass * w;
+        for (int a = 0; a < k; a++)
+        {
+            next[first_attacker + a] += alpha * (attack_mass - pi[first_attacker + a]) * w;
+        }
+    }
+    else if (type == ATTACK_RING)
+    {
+        /* Anneau: a_i -> a_{i+1}, dernier attaquant -> cible. */
+        for (int a = 0; a < k; a++)
+        {
+            int src = first_attacker + a;
+            int dest = (a == k - 1) ? target : (src + 1);
+            next[dest] += alpha * pi[src];
+        }
+    }
+
+    /* Terme de teleportation (1-alpha) + redistribution de la masse dangling. */
+    double uniform = (1.0 - alpha) / total_n + alpha * dangling / total_n;
+    for (int i = 0; i < total_n; i++)
+        next[i] += uniform;
 }
 
-/* =========================================================
- *  Algorithme PageRank  (inchangé)
- * ========================================================= */
-double *pagerank(const Graph *g, double alpha, int verbose) {
-    int n = g->n;
-    double *pi_cur = calloc(n, sizeof(double));
-    double *pi_nxt = calloc(n, sizeof(double));
-    if (!pi_cur || !pi_nxt) { fprintf(stderr, "Erreur alloc pagerank\n"); exit(1); }
+/*
+ * Initialisation "chaude" du vecteur de probabilite pour le graphe attaque.
+ * Plutot que de partir d'une distribution uniforme stricte, on rescale
+ * le PageRank de base sur les noeuds originaux et on attribue 1/total_n
+ * aux nouveaux attaquants. Cela reduit le nombre d'iterations necessaires.
+ */
+static void warm_init(const double *pr_base, int base_n, int k, double *cur)
+{
+    int total_n = base_n + k;
+    double scale = (double)base_n / (double)total_n;
+    for (int i = 0; i < base_n; i++)
+        cur[i] = pr_base[i] * scale;
+    double share = 1.0 / (double)total_n;
+    for (int a = 0; a < k; a++)
+        cur[base_n + a] = share;
+}
 
-    for (int i = 0; i < n; i++) pi_cur[i] = 1.0 / n;
+/* Calcule le PageRank du graphe etendu (base + k attaquants) par iteration de
+ * puissance, en utilisant multiply_attack pour simuler la structure d'attaque
+ * sans allouer de nouvelle matrice. Retourne le score de la cible apres
+ * convergence ainsi que le nombre d'iterations et le temps CPU. */
+static PageRankRun pagerank_attack(const Graph *g, double alpha, AttackType type,
+                                   int target, int k, const double *pr_base)
+{
+    int total_n = g->n + k;
+    double *cur = xmalloc((size_t)total_n * sizeof(double));
+    double *next = xcalloc((size_t)total_n, sizeof(double));
 
-    mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-    double norm = norme_L1(pi_cur, pi_nxt, n);
+    if (pr_base)
+    {
+        warm_init(pr_base, g->n, k, cur);
+    }
+    else
+    {
+        for (int i = 0; i < total_n; i++)
+            cur[i] = 1.0 / total_n;
+    }
+
+    clock_t t0 = clock();
     int iter = 0;
-
-    while (iter < MAX_IT && norm > EPS) {
-        double *tmp = pi_cur; pi_cur = pi_nxt; pi_nxt = tmp;
-        mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-        norm = norme_L1(pi_cur, pi_nxt, n);
-        if (verbose) printf("  Iteration %d - Norme = %.10f\n", iter, norm);
+    double diff;
+    do
+    {
+        multiply_attack(g, cur, alpha, type, target, k, next);
+        diff = l1_diff(cur, next, total_n);
+        double *tmp = cur;
+        cur = next;
+        next = tmp;
         iter++;
-    }
-    if (verbose) printf("  Convergence en %d iterations\n\n", iter + 1);
+    } while (diff > EPS && iter < MAX_IT);
 
-    free(pi_cur);
-    return pi_nxt;
+    PageRankRun run = {cur[target], iter, seconds_since(t0)};
+    free(cur);
+    free(next);
+    return run;
 }
 
-/* =========================================================
- *  [AJOUT TD2 Q5] Étude précision/itérations
- *  Fait varier ε et mesure le nombre d'itérations à convergence.
- *  Exporte dans un CSV.
- * ========================================================= */
-void etude_precision_iterations(const Graph *g, double alpha,
-                                 const char *csv_path) {
-    /* Valeurs de ε à tester */
-    double epsilons[] = { 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7 };
-    int    ne         = sizeof(epsilons) / sizeof(epsilons[0]);
-    int    n          = g->n;
+/* Comparateur descendant sur le score PageRank, pour qsort. */
+static int compare_ranked_desc(const void *a, const void *b)
+{
+    const RankedNode *ra = (const RankedNode *)a;
+    const RankedNode *rb = (const RankedNode *)b;
+    if (ra->score < rb->score)
+        return 1;
+    if (ra->score > rb->score)
+        return -1;
+    return ra->node - rb->node;
+}
 
-    FILE *csv = fopen(csv_path, "w");
-    if (!csv) { fprintf(stderr, "Impossible de créer %s\n", csv_path); exit(1); }
-    fprintf(csv, "epsilon,iterations\n");
+static const char *attack_name(AttackType type)
+{
+    switch (type)
+    {
+    case ATTACK_ISOLATED:
+        return "isoles";
+    case ATTACK_COMPLETE:
+        return "complet";
+    case ATTACK_RING:
+        return "anneau";
+    default:
+        return "inconnu";
+    }
+}
 
-    printf("\n=== Étude précision / itérations (alpha=%.2f) ===\n", alpha);
-    printf("  %-12s  %s\n", "Epsilon", "Iterations");
+static const char *target_name(int i)
+{
+    switch (i)
+    {
+    case TARGET_FORTE:
+        return "forte";
+    case TARGET_MOYENNE:
+        return "moyenne";
+    case TARGET_FAIBLE:
+        return "faible";
+    default:
+        return "inconnu";
+    }
+}
 
-    for (int e = 0; e < ne; e++) {
-        double eps = epsilons[e];
-        double *pi_cur = calloc(n, sizeof(double));
-        double *pi_nxt = calloc(n, sizeof(double));
-        for (int i = 0; i < n; i++) pi_cur[i] = 1.0 / n;
+/* Selectionne trois cibles representant les extremes et la mediane du classement
+ * PageRank: rang 1 (forte), rang n/2 (moyenne), rang n (faible).
+ * Ecrit les indices de noeuds dans targets[] et leurs rangs dans ranks[]. */
+static void choose_targets(const double *pr, int n, int targets[3], int ranks[3])
+{
+    RankedNode *ranking = xmalloc((size_t)n * sizeof(RankedNode));
+    for (int i = 0; i < n; i++)
+    {
+        ranking[i].node = i;
+        ranking[i].score = pr[i];
+    }
+    qsort(ranking, (size_t)n, sizeof(RankedNode), compare_ranked_desc);
 
-        mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-        double norm = norme_L1(pi_cur, pi_nxt, n);
-        int iter = 0;
+    int pos[3] = {0, n / 2, n - 1};
+    for (int i = 0; i < 3; i++)
+    {
+        targets[i] = ranking[pos[i]].node;
+        ranks[i] = pos[i] + 1;
+    }
 
-        while (iter < MAX_IT && norm > eps) {
-            double *tmp = pi_cur; pi_cur = pi_nxt; pi_nxt = tmp;
-            mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-            norm = norme_L1(pi_cur, pi_nxt, n);
-            iter++;
+    free(ranking);
+}
+
+/* Parse une liste d'alphas separes par des virgules ou des espaces.
+ * Les valeurs hors de ]0,1[ sont ignorees avec un avertissement. */
+static void parse_alpha_list(const char *s, RunOptions *opts)
+{
+    opts->n_alphas = 0;
+    const char *p = s;
+    while (*p)
+    {
+        while (*p && (*p == ',' || isspace((unsigned char)*p)))
+            p++;
+        if (!*p)
+            break;
+        char *end = NULL;
+        double a = strtod(p, &end);
+        if (end == p)
+            break;
+        if (a <= 0.0 || a >= 1.0)
+        {
+            fprintf(stderr, "Alpha %.4f hors de ]0,1[, ignore\n", a);
         }
-        iter++;  /* compte l'itération initiale */
-
-        printf("  %-12.1e  %d\n", eps, iter);
-        fprintf(csv, "%.10e,%d\n", eps, iter);
-
-        free(pi_cur);
-        free(pi_nxt);
-    }
-    fclose(csv);
-    printf("  → CSV : %s\n", csv_path);
-}
-
-/* =========================================================
- *  [AJOUT TD2 Q6] Étude itérations / alpha
- *  Fait varier α sur [0.50, 0.99] et mesure les itérations.
- *  Exporte dans un CSV.
- * ========================================================= */
-void etude_iterations_alpha(const Graph *g, const char *csv_path) {
-    int    n        = g->n;
-    int    n_points = 20;          /* nombre de valeurs d'alpha testées */
-    double a_min    = 0.50;
-    double a_max    = 0.99;
-
-    FILE *csv = fopen(csv_path, "w");
-    if (!csv) { fprintf(stderr, "Impossible de créer %s\n", csv_path); exit(1); }
-    fprintf(csv, "alpha,iterations\n");
-
-    printf("\n=== Étude itérations / alpha (eps=%.1e) ===\n", EPS);
-    printf("  %-8s  %s\n", "Alpha", "Iterations");
-
-    for (int p = 0; p < n_points; p++) {
-        double alpha = a_min + p * (a_max - a_min) / (n_points - 1);
-
-        double *pi_cur = calloc(n, sizeof(double));
-        double *pi_nxt = calloc(n, sizeof(double));
-        for (int i = 0; i < n; i++) pi_cur[i] = 1.0 / n;
-
-        mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-        double norm = norme_L1(pi_cur, pi_nxt, n);
-        int iter = 0;
-
-        while (iter < MAX_IT && norm > EPS) {
-            double *tmp = pi_cur; pi_cur = pi_nxt; pi_nxt = tmp;
-            mult_vect_mat_csr(pi_cur, g, alpha, pi_nxt);
-            norm = norme_L1(pi_cur, pi_nxt, n);
-            iter++;
+        else if (opts->n_alphas < MAX_ALPHAS)
+        {
+            opts->alphas[opts->n_alphas++] = a;
         }
-        iter++;
-
-        printf("  %-8.4f  %d\n", alpha, iter);
-        fprintf(csv, "%.6f,%d\n", alpha, iter);
-
-        free(pi_cur);
-        free(pi_nxt);
+        p = end;
     }
-    fclose(csv);
-    printf("  → CSV : %s\n", csv_path);
 }
 
-/* =========================================================
- *  [AJOUT TD1 Q1] Vérification dense vs CSR sur petit graphe
- *  Compare les résultats PageRank des deux méthodes.
- *  N'est appelée que si n <= seuil (évite l'explosion mémoire).
- * ========================================================= */
-void verifier_dense_vs_csr(const Graph *g, double alpha) {
-    int n         = g->n;
-    int seuil     = 500;
-    if (n > seuil) {
-        printf("[Dense] Graphe trop grand (%d > %d), vérification ignorée.\n\n",
-               n, seuil);
+/* Parse les options en ligne de commande et remplit opts.
+ * Retourne 0 en succes, -1 si une option inconnue est rencontree.
+ * *positional_start est positionne sur le premier argument non-option. */
+static int parse_options(int argc, char **argv, RunOptions *opts,
+                         int *positional_start)
+{
+    opts->verbose = 1;
+    opts->k_step = 1;
+    opts->professor_k = 0;
+    opts->n_alphas = 0;
+
+    int i = 1;
+    while (i < argc)
+    {
+        const char *a = argv[i];
+        if (strcmp(a, "--quiet") == 0)
+        {
+            opts->verbose = 0;
+            i++;
+        }
+        else if (strcmp(a, "--prof-k") == 0)
+        {
+            opts->professor_k = 1;
+            i++;
+        }
+        else if (strcmp(a, "--alpha-sweep") == 0 && i + 1 < argc)
+        {
+            parse_alpha_list(argv[i + 1], opts);
+            i += 2;
+        }
+        else if (strcmp(a, "--k-step") == 0 && i + 1 < argc)
+        {
+            int s = atoi(argv[i + 1]);
+            opts->k_step = s > 0 ? s : 1;
+            i += 2;
+        }
+        else if (a[0] == '-' && a[1] == '-')
+        {
+            fprintf(stderr, "Option inconnue: %s\n", a);
+            return -1;
+        }
+        else
+        {
+            break;
+        }
+    }
+    *positional_start = i;
+    return 0;
+}
+
+/* Lance les trois types d'attaque sur les trois cibles pour un k donne
+ * et ecrit une ligne CSV par combinaison (9 lignes au total par appel). */
+static void write_attack_rows_for_k(const Graph *g, double alpha, int k,
+                                    const char *filename, FILE *csv,
+                                    const double *pr, const int targets[3],
+                                    const int ranks[3])
+{
+    AttackType attacks[3] = {ATTACK_ISOLATED, ATTACK_COMPLETE, ATTACK_RING};
+
+    for (int c = 0; c < 3; c++)
+    {
+        int target = targets[c];
+        for (int a = 0; a < 3; a++)
+        {
+            PageRankRun run = pagerank_attack(g, alpha, attacks[a], target,
+                                              k, pr);
+            double before = pr[target];
+            double after = run.score;
+            double ratio = before > 0.0 ? after / before : 0.0;
+
+            fprintf(csv, "%s,%d,%d,%.6f,%d,%s,%d,%d,%.15f,%s,%.15f,%.15f,"
+                         "%.6f,%d,%.4f\n",
+                    filename, g->n, g->m, alpha, k, target_name(c),
+                    target + 1, ranks[c], before, attack_name(attacks[a]),
+                    after, after - before, ratio, run.iterations,
+                    run.seconds);
+        }
+    }
+}
+
+/* Orchestre la simulation complete pour un alpha donne:
+ * 1) calcul du PageRank de base;
+ * 2) selection des trois cibles;
+ * 3) boucle sur les valeurs de k (mode normal, --prof-k ou --k-step);
+ * 4) ecriture de l'en-tete CSV si write_header != 0. */
+static void run_simulation(const Graph *g, double alpha, int k_max,
+                           const RunOptions *opts, const char *filename,
+                           FILE *csv, int write_header)
+{
+    if (write_header)
+    {
+        fprintf(csv, "fichier,n,m,alpha,k,type_cible,page_cible,rank_initial,"
+                     "pagerank_initial,type_attaque,pagerank_apres,augmentation,"
+                     "ratio,iterations,temps_sec\n");
+    }
+
+    double *pr = xmalloc((size_t)g->n * sizeof(double));
+    PageRankRun base = pagerank_base(g, alpha, pr);
+    if (opts->verbose)
+    {
+        printf("[alpha=%.3f] PageRank initial: %d iters, %.3fs\n",
+               alpha, base.iterations, base.seconds);
+    }
+
+    int targets[3], ranks[3];
+    choose_targets(pr, g->n, targets, ranks);
+
+    if (opts->verbose)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            printf("  cible %-8s: page %d, rang %d, PR=%.12f\n",
+                   target_name(i), targets[i] + 1, ranks[i], pr[targets[i]]);
+        }
+    }
+
+    if (opts->professor_k)
+    {
+        /* Mode --prof-k: liste fixe de valeurs de k pedagogiques. */
+        int sizes[] = {1, 2, 5, 10, 20, 50, 100, 200};
+        int nb_sizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+        int last_k = 0;
+        for (int i = 0; i < nb_sizes; i++)
+        {
+            int k = sizes[i];
+            if (k > k_max)
+                break;
+            write_attack_rows_for_k(g, alpha, k, filename, csv, pr, targets, ranks);
+            last_k = k;
+            if (opts->verbose)
+                printf("  k=%d termine\n", k);
+        }
+        /* On s'assure que k_max est toujours teste, meme s'il n'est pas dans la liste. */
+        if (last_k != k_max)
+        {
+            write_attack_rows_for_k(g, alpha, k_max, filename, csv, pr, targets, ranks);
+            if (opts->verbose)
+                printf("  k=%d termine\n", k_max);
+        }
+        free(pr);
         return;
     }
 
-    printf("\n=== Vérification matrice dense vs CSR (n=%d) ===\n", n);
+    /* Mode normal ou --k-step: on avance de k_step en k_step jusqu'a k_max. */
+    int k = 1;
+    while (k <= k_max)
+    {
+        write_attack_rows_for_k(g, alpha, k, filename, csv, pr, targets, ranks);
+        if (opts->verbose)
+            printf("  k=%d termine\n", k);
 
-    DenseMatrix dm = csr_to_dense_google(g, alpha);
-    if (n <= 20) dense_afficher(&dm);
-
-    /* PageRank via matrice dense */
-    double *pi_cur = calloc(n, sizeof(double));
-    double *pi_nxt = calloc(n, sizeof(double));
-    for (int i = 0; i < n; i++) pi_cur[i] = 1.0 / n;
-
-    mult_vect_mat_dense(pi_cur, &dm, pi_nxt);
-    double norm = norme_L1(pi_cur, pi_nxt, n);
-    int iter = 0;
-
-    while (iter < MAX_IT && norm > EPS) {
-        double *tmp = pi_cur; pi_cur = pi_nxt; pi_nxt = tmp;
-        mult_vect_mat_dense(pi_cur, &dm, pi_nxt);
-        norm = norme_L1(pi_cur, pi_nxt, n);
-        iter++;
-    }
-    double *pr_dense = pi_nxt;
-    printf("  Dense  : convergence en %d itérations\n", iter + 1);
-
-    /* PageRank via CSR */
-    double *pr_csr = pagerank(g, alpha, 0);
-
-    /* Comparer les deux vecteurs */
-    double diff = norme_L1(pr_dense, pr_csr, n);
-    printf("  ||PR_dense - PR_CSR||_1 = %.2e  %s\n\n",
-           diff, diff < 1e-8 ? "(OK)" : "(ATTENTION: écart non négligeable)");
-
-    free(pi_cur);
-    free(pr_csr);
-    dense_free(&dm);
-}
-
-/* =========================================================
- *  Copie de base commune aux trois attaques  (inchangée)
- * ========================================================= */
-static int copier_base(const Graph *g, Graph *g2) {
-    int pos = 0;
-    g2->row_ptr[0] = 0;
-    for (int i = 0; i < g->n; i++) {
-        for (int j = g->row_ptr[i]; j < g->row_ptr[i+1]; j++) {
-            g2->col_idx[pos] = g->col_idx[j];
-            g2->val[pos]     = g->val[j];
-            pos++;
+        if (opts->k_step <= 1 || k == k_max)
+        {
+            k++;
         }
-        g2->row_ptr[i+1] = pos;
-    }
-    return pos;
-}
-
-/* =========================================================
- *  Attaque 1 : k noeuds isolés pointant vers target  (inchangée)
- * ========================================================= */
-Graph attaque_isoles(const Graph *g, int k, int target) {
-    Graph g2;
-    g2.n = g->n + k;
-    g2.m = g->m + k;
-    g2.row_ptr = malloc((g2.n + 1) * sizeof(int));
-    g2.col_idx = malloc(g2.m * sizeof(int));
-    g2.val     = malloc(g2.m * sizeof(double));
-
-    int pos = copier_base(g, &g2);
-    for (int a = 0; a < k; a++) {
-        g2.col_idx[pos] = target;
-        g2.val[pos]     = 1.0;
-        pos++;
-        g2.row_ptr[g->n + a + 1] = pos;
-    }
-    return g2;
-}
-
-/* =========================================================
- *  Attaque 2 : graphe complet à k noeuds  (inchangée)
- * ========================================================= */
-Graph attaque_complet(const Graph *g, int k, int target) {
-    if (k > K_MAX_COMPLET) {
-        fprintf(stderr, "Erreur: k=%d dépasse K_MAX_COMPLET=%d\n", k, K_MAX_COMPLET);
-        exit(1);
-    }
-    int arcs_new = k * k;
-    Graph g2;
-    g2.n = g->n + k;
-    g2.m = g->m + arcs_new;
-    g2.row_ptr = malloc((g2.n + 1) * sizeof(int));
-    g2.col_idx = malloc(g2.m * sizeof(int));
-    g2.val     = malloc(g2.m * sizeof(double));
-
-    int pos = copier_base(g, &g2);
-    for (int a = 0; a < k; a++) {
-        double w = 1.0 / k;
-        g2.col_idx[pos] = target;
-        g2.val[pos]     = w;
-        pos++;
-        for (int b = 0; b < k; b++) {
-            if (b == a) continue;
-            g2.col_idx[pos] = g->n + b;
-            g2.val[pos]     = w;
-            pos++;
-        }
-        g2.row_ptr[g->n + a + 1] = pos;
-    }
-    return g2;
-}
-
-/* =========================================================
- *  Attaque 3 : anneau à k+1 sommets  (inchangée)
- * ========================================================= */
-Graph attaque_anneau(const Graph *g, int k, int target) {
-    Graph g2;
-    g2.n = g->n + k;
-    g2.m = g->m + k + 1;
-    g2.row_ptr = malloc((g2.n + 1) * sizeof(int));
-    g2.col_idx = malloc(g2.m * sizeof(int));
-    g2.val     = malloc(g2.m * sizeof(double));
-
-    int pos = 0;
-    g2.row_ptr[0] = 0;
-    int n0 = g->n;
-
-    for (int i = 0; i < g->n; i++) {
-        int old_deg = g->row_ptr[i+1] - g->row_ptr[i];
-        if (i == target) {
-            int    new_deg = old_deg + 1;
-            double w       = 1.0 / new_deg;
-            for (int j = g->row_ptr[i]; j < g->row_ptr[i+1]; j++) {
-                g2.col_idx[pos] = g->col_idx[j];
-                g2.val[pos]     = w;
-                pos++;
+        else
+        {
+            int next_k = k + opts->k_step;
+            if (next_k > k_max && k != k_max)
+            {
+                k = k_max;
             }
-            g2.col_idx[pos] = n0;
-            g2.val[pos]     = w;
-            pos++;
-        } else {
-            for (int j = g->row_ptr[i]; j < g->row_ptr[i+1]; j++) {
-                g2.col_idx[pos] = g->col_idx[j];
-                g2.val[pos]     = g->val[j];
-                pos++;
+            else
+            {
+                k = next_k;
             }
         }
-        g2.row_ptr[i+1] = pos;
     }
-
-    for (int a = 0; a < k; a++) {
-        int dest = (a == k - 1) ? target : (n0 + a + 1);
-        g2.col_idx[pos] = dest;
-        g2.val[pos]     = 1.0;
-        pos++;
-        g2.row_ptr[n0 + a + 1] = pos;
-    }
-    return g2;
-}
-
-/* =========================================================
- *  Tri par score décroissant  (inchangé)
- * ========================================================= */
-typedef struct { int idx; double score; } Ranked;
-
-int cmp_ranked_desc(const void *a, const void *b) {
-    double da = ((const Ranked *)a)->score;
-    double db = ((const Ranked *)b)->score;
-    return (da < db) - (da > db);
-}
-
-/* =========================================================
- *  Choix des trois cibles  (inchangé)
- * ========================================================= */
-void choisir_cibles(const double *pr, int n,
-                    int *target_fort, int *target_med, int *target_faible) {
-    Ranked *r = malloc(n * sizeof(Ranked));
-    for (int i = 0; i < n; i++) { r[i].idx = i; r[i].score = pr[i]; }
-    qsort(r, n, sizeof(Ranked), cmp_ranked_desc);
-    *target_fort   = r[n / 10].idx;
-    *target_med    = r[n / 2].idx;
-    *target_faible = r[n - 1 - n / 10].idx;
-    free(r);
-}
-
-/* =========================================================
- *  Affiche top-10, médiane, bottom-10  (inchangé)
- * ========================================================= */
-void afficher_classement(const double *pr, int n) {
-    Ranked *r = malloc(n * sizeof(Ranked));
-    for (int i = 0; i < n; i++) { r[i].idx = i; r[i].score = pr[i]; }
-    qsort(r, n, sizeof(Ranked), cmp_ranked_desc);
-
-    printf("--- Top 10 ---\n");
-    for (int i = 0; i < 10 && i < n; i++)
-        printf("  Page %4d : %.10f\n", r[i].idx, r[i].score);
-
-    printf("--- Page médiane (rang %d) ---\n", n / 2);
-    printf("  Page %4d : %.10f\n", r[n/2].idx, r[n/2].score);
-
-    printf("--- Bottom 10 ---\n");
-    for (int i = n - 10; i < n; i++)
-        printf("  Page %4d : %.10f\n", r[i].idx, r[i].score);
-
-    free(r);
-}
-
-/* =========================================================
- *  Boucle principale d'étude  (inchangée)
- * ========================================================= */
-void etude_complete(const Graph *g, const double *pr, double alpha,
-                    int target_fort, int target_med, int target_faible,
-                    int k_max, const char *csv_path) {
-
-    FILE *csv = fopen(csv_path, "w");
-    if (!csv) { fprintf(stderr, "Impossible de créer %s\n", csv_path); exit(1); }
-
-    fprintf(csv,
-        "k,"
-        "fort_isoles,fort_complet,fort_anneau,"
-        "med_isoles,med_complet,med_anneau,"
-        "faible_isoles,faible_complet,faible_anneau,"
-        "fort_gain_isoles,fort_gain_complet,fort_gain_anneau,"
-        "med_gain_isoles,med_gain_complet,med_gain_anneau,"
-        "faible_gain_isoles,faible_gain_complet,faible_gain_anneau\n");
-
-    int    targets[3] = { target_fort, target_med, target_faible };
-    double pr0[3]     = { pr[target_fort], pr[target_med], pr[target_faible] };
-    const char *labels[3] = { "Fort  ", "Median", "Faible" };
-
-    printf("\n%5s | %-8s | %10s %10s %10s | %10s %10s %10s\n",
-           "k", "Cible", "Isoles", "Complet", "Anneau",
-           "Gain_I", "Gain_C", "Gain_A");
-    printf("%s\n", "------+----------+-----------------------------------+"
-                   "-------------------------------------");
-
-    for (int k = 1; k <= k_max; k++) {
-        double scores[3][3];
-        for (int c = 0; c < 3; c++) {
-            int t = targets[c];
-            Graph gi = attaque_isoles (g, k, t);
-            Graph gc = attaque_complet(g, k, t);
-            Graph ga = attaque_anneau (g, k, t);
-
-            double *pri = pagerank(&gi, alpha, 0);
-            double *prc = pagerank(&gc, alpha, 0);
-            double *pra = pagerank(&ga, alpha, 0);
-
-            scores[c][0] = pri[t];
-            scores[c][1] = prc[t];
-            scores[c][2] = pra[t];
-
-            free(pri); free_graph(&gi);
-            free(prc); free_graph(&gc);
-            free(pra); free_graph(&ga);
-        }
-
-        for (int c = 0; c < 3; c++) {
-            printf("%5d | %s | %10.7f %10.7f %10.7f | %10.4fx %10.4fx %10.4fx\n",
-                   k, labels[c],
-                   scores[c][0], scores[c][1], scores[c][2],
-                   scores[c][0] / pr0[c],
-                   scores[c][1] / pr0[c],
-                   scores[c][2] / pr0[c]);
-        }
-        printf("\n");
-
-        fprintf(csv, "%d,"
-                "%.10f,%.10f,%.10f,"
-                "%.10f,%.10f,%.10f,"
-                "%.10f,%.10f,%.10f,"
-                "%.6f,%.6f,%.6f,"
-                "%.6f,%.6f,%.6f,"
-                "%.6f,%.6f,%.6f\n",
-                k,
-                scores[0][0], scores[0][1], scores[0][2],
-                scores[1][0], scores[1][1], scores[1][2],
-                scores[2][0], scores[2][1], scores[2][2],
-                scores[0][0]/pr0[0], scores[0][1]/pr0[0], scores[0][2]/pr0[0],
-                scores[1][0]/pr0[1], scores[1][1]/pr0[1], scores[1][2]/pr0[1],
-                scores[2][0]/pr0[2], scores[2][1]/pr0[2], scores[2][2]/pr0[2]);
-    }
-    fclose(csv);
-    printf("\nRésultats CSV exportés dans : %s\n", csv_path);
-}
-
-/* =========================================================
- *  main
- * ========================================================= */
-int main(int argc, char *argv[]) {
-    const char *filename = "Harvard500.txt";
-    double alpha = 0.85;
-    int    k_max = 100;
-
-    if (argc >= 2) filename = argv[1];
-    if (argc >= 3) alpha    = atof(argv[2]);
-    if (argc >= 4) k_max    = atoi(argv[3]);
-
-    if (alpha <= 0.0 || alpha >= 1.0) {
-        fprintf(stderr, "Erreur: alpha doit être dans ]0,1[\n");
-        return 1;
-    }
-    if (k_max <= 0) {
-        fprintf(stderr, "Erreur: k_max doit être > 0\n");
-        return 1;
-    }
-
-    printf("=== Google Bombing Simulation ===\n");
-    printf("Fichier : %s  |  alpha = %.2f  |  k_max = %d\n\n",
-           filename, alpha, k_max);
-
-    Graph g = lire_graphe(filename);
-    printf("Graphe chargé : n = %d  m = %d\n\n", g.n, g.m);
-
-    /* -------------------------------------------------------
-     *  [AJOUT TD1 Q1] Vérification dense vs CSR
-     *  (automatiquement ignorée si n > 500)
-     * ----------------------------------------------------- */
-    verifier_dense_vs_csr(&g, alpha);
-
-    printf("Calcul du PageRank initial...\n");
-    double *pr = pagerank(&g, alpha, 1);
-
-    afficher_classement(pr, g.n);
-
-    int tf, tm, tw;
-    choisir_cibles(pr, g.n, &tf, &tm, &tw);
-
-    printf("\n=== Cibles choisies ===\n");
-    printf("  Fort   : page %d  (PR = %.10f, rang top 10%%)\n",    tf, pr[tf]);
-    printf("  Median : page %d  (PR = %.10f, rang 50%%)\n",        tm, pr[tm]);
-    printf("  Faible : page %d  (PR = %.10f, rang bottom 10%%)\n", tw, pr[tw]);
-
-    /* -------------------------------------------------------
-     *  [AJOUT TD2 Q5] Courbe précision / itérations
-     * ----------------------------------------------------- */
-    etude_precision_iterations(&g, alpha, "courbe_precision.csv");
-
-    /* -------------------------------------------------------
-     *  [AJOUT TD2 Q6] Courbe itérations / alpha
-     * ----------------------------------------------------- */
-    etude_iterations_alpha(&g, "courbe_alpha.csv");
-
-    printf("\n=== Étude k = 1..%d ===\n\n", k_max);
-    etude_complete(&g, pr, alpha, tf, tm, tw, k_max, "resultats.csv");
 
     free(pr);
-    free_graph(&g);
+}
 
-    return 0;
+int main(int argc, char **argv)
+{
+    RunOptions opts;
+    int pos_start = 1;
+    if (parse_options(argc, argv, &opts, &pos_start) < 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    int remaining = argc - pos_start;
+    const char *filename = remaining >= 1 ? argv[pos_start + 0] : "data/Harvard500.txt";
+    double alpha_arg = remaining >= 2 ? atof(argv[pos_start + 1]) : 0.85;
+    int k_max = remaining >= 3 ? atoi(argv[pos_start + 2]) : 100;
+    const char *csv_path = remaining >= 4 ? argv[pos_start + 3]
+                                          : "results/resultats_final.csv";
+
+    if (opts.n_alphas == 0)
+    {
+        if (alpha_arg <= 0.0 || alpha_arg >= 1.0)
+        {
+            fprintf(stderr, "Erreur: alpha doit etre dans ]0,1[ (recu %.3f)\n",
+                    alpha_arg);
+            return EXIT_FAILURE;
+        }
+        opts.alphas[opts.n_alphas++] = alpha_arg;
+    }
+    if (k_max < 0)
+    {
+        fprintf(stderr, "Erreur: k_max doit etre positif ou nul\n");
+        return EXIT_FAILURE;
+    }
+
+    if (opts.verbose)
+    {
+        printf("=== Google Bombing - simulation ===\n");
+        printf("Fichier  : %s\n", filename);
+        if (opts.professor_k)
+        {
+            printf("k_max    : %d (mode prof: 1,2,5,10,20,50,100,200)\n", k_max);
+        }
+        else
+        {
+            printf("k_max    : %d (pas %d)\n", k_max, opts.k_step);
+        }
+        printf("alphas   :");
+        for (int i = 0; i < opts.n_alphas; i++)
+            printf(" %.3f", opts.alphas[i]);
+        printf("\nSortie   : %s\n", csv_path);
+    }
+
+    Graph g = read_graph(filename);
+    if (opts.verbose)
+        printf("Graphe charge: n=%d, m=%d\n", g.n, g.m);
+
+    if (k_max == 0)
+    {
+        if (opts.verbose)
+            printf("Mode verification: lecture OK, pas de simulation.\n");
+        free_graph(&g);
+        return EXIT_SUCCESS;
+    }
+
+    FILE *csv = fopen(csv_path, "w");
+    if (!csv)
+    {
+        fprintf(stderr, "Erreur creation %s\n", csv_path);
+        free_graph(&g);
+        return EXIT_FAILURE;
+    }
+
+    /* Lancement de la simulation pour chaque alpha (un seul si pas de sweep). */
+    for (int i = 0; i < opts.n_alphas; i++)
+    {
+        run_simulation(&g, opts.alphas[i], k_max, &opts, filename, csv, i == 0);
+    }
+
+    fclose(csv);
+    if (opts.verbose)
+        printf("Resultats exportes dans %s\n", csv_path);
+
+    free_graph(&g);
+    return EXIT_SUCCESS;
 }
