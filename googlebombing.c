@@ -37,7 +37,7 @@
 #include <math.h>
 #include <time.h>
 
-#define EPS 1e-10     /* seuil de convergence L1 pour l'iteration de puissance */
+#define EPS 1e-6     /* seuil de convergence L1 pour l'iteration de puissance */
 #define MAX_IT 1000   /* nombre maximum d'iterations PageRank avant arret force */
 #define MAX_ALPHAS 32 /* nombre maximum de valeurs d'alpha dans un alpha-sweep  */
 
